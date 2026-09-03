@@ -1064,11 +1064,14 @@ async fn async_main(
             if manager_reaper.is_shutting_down() {
                 break;
             }
-            manager_reaper.reap_and_stop_orphans().await;
+            // The wake may be an advertised retry deadline. Dispatch that
+            // convergence before orphan reaping, which can wait behind a
+            // foreground attachment transition for an unbounded interval.
+            manager_reaper.converge_all_project_availability().await;
             if manager_reaper.is_shutting_down() {
                 break;
             }
-            manager_reaper.converge_all_project_availability().await;
+            manager_reaper.reap_and_stop_orphans().await;
         }
     });
 

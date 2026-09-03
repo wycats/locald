@@ -209,7 +209,13 @@ struct AvailabilityConvergenceOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AvailabilityRuntimeIdentity {
     configuration_revision: Option<u64>,
+    attempt_generation: u64,
     service_runtimes: BTreeMap<ServiceKey, (u64, bool)>,
+}
+
+struct ServiceStatusListSnapshot {
+    entries: Vec<(ProjectInstanceId, ServiceStatus)>,
+    runtime_identities: HashMap<ProjectInstanceId, AvailabilityRuntimeIdentity>,
 }
 
 struct AvailabilityActionFinalization {
@@ -1209,6 +1215,7 @@ pub struct ProcessManager {
     availability_retries: Arc<StdMutex<HashMap<ProjectInstanceId, AvailabilityRetryState>>>,
     availability_runtime_recovery_identity:
         Arc<StdMutex<HashMap<ProjectInstanceId, AvailabilityRuntimeIdentity>>>,
+    availability_runtime_attempt_generations: Arc<StdMutex<HashMap<ProjectInstanceId, u64>>>,
     availability_retry_changed: Arc<Notify>,
     availability_transition_gate: Arc<RwLock<()>>,
     pending_config_reloads: Arc<Mutex<HashSet<ProjectInstanceId>>>,
@@ -1451,6 +1458,15 @@ impl ProcessManager {
         }
     }
 
+    fn advance_availability_runtime_attempt_generation(&self, instance_id: ProjectInstanceId) {
+        let mut generations = self
+            .availability_runtime_attempt_generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = generations.entry(instance_id).or_default();
+        *generation = generation.saturating_add(1);
+    }
+
     fn availability_runtime_recovery_matches(
         &self,
         instance_id: ProjectInstanceId,
@@ -1488,8 +1504,16 @@ impl ProcessManager {
                 )
             })
             .collect();
+        let attempt_generation = self
+            .availability_runtime_attempt_generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&instance_id)
+            .copied()
+            .unwrap_or_default();
         AvailabilityRuntimeIdentity {
             configuration_revision,
+            attempt_generation,
             service_runtimes,
         }
     }
@@ -2006,6 +2030,7 @@ impl ProcessManager {
             availability_coordinators: Arc::new(Mutex::new(HashMap::new())),
             availability_retries: Arc::new(StdMutex::new(HashMap::new())),
             availability_runtime_recovery_identity: Arc::new(StdMutex::new(HashMap::new())),
+            availability_runtime_attempt_generations: Arc::new(StdMutex::new(HashMap::new())),
             availability_retry_changed: Arc::new(Notify::new()),
             availability_transition_gate: Arc::new(RwLock::new(())),
             pending_config_reloads: Arc::new(Mutex::new(HashSet::new())),
@@ -3260,6 +3285,10 @@ impl ProcessManager {
 
     fn retire_log_buffers_for_instance(&self, instance_id: ProjectInstanceId) {
         self.clear_availability_retry(instance_id);
+        self.availability_runtime_attempt_generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&instance_id);
         #[allow(clippy::expect_used)]
         let mut buffers = self.log_buffers.lock().expect("log buffer mutex poisoned");
         buffers.retain(|key, _| key.instance() != instance_id);
@@ -7148,6 +7177,11 @@ impl ProcessManager {
             });
         }
 
+        // A valid managed configuration has reached runtime convergence. This
+        // generation advances even when every controller is reusable, so late
+        // readiness can be attributed to this exact attempt without treating
+        // a configuration-loading failure as a runtime attempt.
+        self.advance_availability_runtime_attempt_generation(instance_id);
         let service_readiness_deadline = share_service_readiness_budget
             .then(|| tokio::time::Instant::now() + service_readiness_timeout);
 
@@ -8374,9 +8408,24 @@ impl ProcessManager {
         &self,
         instance_filter: Option<ProjectInstanceId>,
     ) -> Vec<(ProjectInstanceId, ServiceStatus)> {
+        self.list_with_instance_owner_snapshot(instance_filter)
+            .await
+            .entries
+    }
+
+    async fn list_with_instance_owner_snapshot(
+        &self,
+        instance_filter: Option<ProjectInstanceId>,
+    ) -> ServiceStatusListSnapshot {
         let proxy_ports = { *self.proxy_ports.lock().await };
         let mut snapshots = Vec::new();
         let mut managed_keys = HashSet::new();
+        let attempt_generations = self
+            .availability_runtime_attempt_generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut runtime_identities = HashMap::new();
 
         {
             let mut services = self.services.lock().await;
@@ -8393,6 +8442,24 @@ impl ProcessManager {
                     continue;
                 }
                 managed_keys.insert(key.clone());
+                runtime_identities
+                    .entry(service.instance_id)
+                    .or_insert_with(|| AvailabilityRuntimeIdentity {
+                        configuration_revision: None,
+                        attempt_generation: attempt_generations
+                            .get(&service.instance_id)
+                            .copied()
+                            .unwrap_or_default(),
+                        service_runtimes: BTreeMap::new(),
+                    })
+                    .service_runtimes
+                    .insert(
+                        key.clone(),
+                        (
+                            service.controller_generation,
+                            matches!(&service.runtime_state, ServiceRuntime::Controller(_)),
+                        ),
+                    );
                 let snapshot = match &service.runtime_state {
                     ServiceRuntime::Controller(c) => RuntimeSnapshot::Controller(c.clone()),
                     ServiceRuntime::None => RuntimeSnapshot::Static {
@@ -8422,25 +8489,41 @@ impl ProcessManager {
             }
         }
 
-        let published = {
-            let registry = self.registry.lock().await;
-            let mut published = Vec::new();
-            for (instance_id, declarations) in registry.published_declarations() {
-                if instance_filter.is_some_and(|filter| filter != instance_id) {
-                    continue;
+        let published =
+            {
+                let registry = self.registry.lock().await;
+                for instance_id in registry.instances.keys().copied().filter(|instance_id| {
+                    instance_filter.is_none_or(|filter| filter == *instance_id)
+                }) {
+                    runtime_identities
+                        .entry(instance_id)
+                        .or_insert_with(|| AvailabilityRuntimeIdentity {
+                            configuration_revision: None,
+                            attempt_generation: attempt_generations
+                                .get(&instance_id)
+                                .copied()
+                                .unwrap_or_default(),
+                            service_runtimes: BTreeMap::new(),
+                        })
+                        .configuration_revision = registry.configuration_revision(instance_id);
                 }
-                let Some(record) = registry.instances.get(&instance_id).cloned() else {
-                    continue;
-                };
-                for declaration in declarations.values() {
-                    let key = ServiceKey::new(instance_id, declaration.service_name.clone());
-                    if !managed_keys.contains(&key) {
-                        published.push((record.clone(), declaration.clone()));
+                let mut published = Vec::new();
+                for (instance_id, declarations) in registry.published_declarations() {
+                    if instance_filter.is_some_and(|filter| filter != instance_id) {
+                        continue;
+                    }
+                    let Some(record) = registry.instances.get(&instance_id).cloned() else {
+                        continue;
+                    };
+                    for declaration in declarations.values() {
+                        let key = ServiceKey::new(instance_id, declaration.service_name.clone());
+                        if !managed_keys.contains(&key) {
+                            published.push((record.clone(), declaration.clone()));
+                        }
                     }
                 }
-            }
-            published
-        };
+                published
+            };
 
         let mut results = Vec::new();
         for (
@@ -8490,7 +8573,10 @@ impl ProcessManager {
                 .cmp(right_instance)
                 .then_with(|| left.name.cmp(&right.name))
         });
-        results
+        ServiceStatusListSnapshot {
+            entries: results,
+            runtime_identities,
+        }
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -8714,14 +8800,30 @@ impl ProcessManager {
                 .map_or(CatalogPresence::Missing, |record| record.presence);
             (instance_id, presence)
         };
-        let service_details = self
-            .list_with_instance_owners(Some(instance_id))
-            .await
+        let service_snapshot = self
+            .list_with_instance_owner_snapshot(Some(instance_id))
+            .await;
+        let service_details = service_snapshot
+            .entries
             .into_iter()
             .map(|(_, status)| status)
             .collect::<Vec<_>>();
+        let runtime_identity = service_snapshot
+            .runtime_identities
+            .get(&instance_id)
+            .cloned()
+            .unwrap_or_else(|| AvailabilityRuntimeIdentity {
+                configuration_revision: None,
+                attempt_generation: 0,
+                service_runtimes: BTreeMap::new(),
+            });
         match self
-            .project_availability_status(instance_id, presence, &service_details)
+            .project_availability_status_with_runtime_identity(
+                instance_id,
+                presence,
+                &service_details,
+                &runtime_identity,
+            )
             .await
         {
             Ok(Some(status)) => Some(status),
@@ -10482,9 +10584,20 @@ impl ProcessManager {
         } else {
             None
         };
-        let mut runtime_statuses = self
-            .list_with_instance_owners(Some(instance_id))
-            .await
+        let service_snapshot = self
+            .list_with_instance_owner_snapshot(Some(instance_id))
+            .await;
+        let runtime_identity = service_snapshot
+            .runtime_identities
+            .get(&instance_id)
+            .cloned()
+            .unwrap_or_else(|| AvailabilityRuntimeIdentity {
+                configuration_revision: None,
+                attempt_generation: 0,
+                service_runtimes: BTreeMap::new(),
+            });
+        let mut runtime_statuses = service_snapshot
+            .entries
             .into_iter()
             .map(|(_, status)| status)
             .collect::<Vec<_>>();
@@ -10495,7 +10608,12 @@ impl ProcessManager {
                 .cmp(right.service_name.as_deref().unwrap_or(&right.name))
         });
         let availability = self
-            .project_availability_status(instance_id, presence, &runtime_statuses)
+            .project_availability_status_with_runtime_identity(
+                instance_id,
+                presence,
+                &runtime_statuses,
+                &runtime_identity,
+            )
             .await?
             .or_else(|| {
                 Some(Self::inactive_project_availability(
@@ -12046,11 +12164,29 @@ impl ProcessManager {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn project_availability_status(
         &self,
         instance_id: ProjectInstanceId,
         presence: CatalogPresence,
         services: &[ServiceStatus],
+    ) -> Result<Option<ProjectAvailabilityStatus>> {
+        let runtime_identity = self.availability_runtime_identity(instance_id).await;
+        self.project_availability_status_with_runtime_identity(
+            instance_id,
+            presence,
+            services,
+            &runtime_identity,
+        )
+        .await
+    }
+
+    async fn project_availability_status_with_runtime_identity(
+        &self,
+        instance_id: ProjectInstanceId,
+        presence: CatalogPresence,
+        services: &[ServiceStatus],
+        runtime_identity: &AvailabilityRuntimeIdentity,
     ) -> Result<Option<ProjectAvailabilityStatus>> {
         if !self.availability_record_exists(instance_id).await? {
             return Ok(None);
@@ -12120,11 +12256,10 @@ impl ProcessManager {
         });
         let desired = availability.desired_up_at(now);
         let paused = availability.is_paused();
-        let runtime_identity = self.availability_runtime_identity(instance_id).await;
         let recovered_runtime = presence == CatalogPresence::Active
             && desired
             && runtime_ready
-            && self.availability_runtime_recovery_matches(instance_id, &runtime_identity);
+            && self.availability_runtime_recovery_matches(instance_id, runtime_identity);
         let last_error = (!recovered_runtime)
             .then(|| availability.last_convergence_error().map(ToOwned::to_owned))
             .flatten();
@@ -12376,15 +12511,21 @@ impl ProcessManager {
             }
         };
 
-        let statuses = match instance_id {
-            Some(instance_id) => self
-                .list_with_instance_owners(Some(instance_id))
-                .await
-                .into_iter()
-                .map(|(_, status)| status)
-                .collect(),
-            None => Vec::new(),
+        let service_snapshot = match instance_id {
+            Some(instance_id) => {
+                self.list_with_instance_owner_snapshot(Some(instance_id))
+                    .await
+            }
+            None => ServiceStatusListSnapshot {
+                entries: Vec::new(),
+                runtime_identities: HashMap::new(),
+            },
         };
+        let statuses = service_snapshot
+            .entries
+            .iter()
+            .map(|(_, status)| status.clone())
+            .collect::<Vec<_>>();
         let mut services = Vec::new();
         let mut service_details = Vec::new();
         let mut is_running = false;
@@ -12397,8 +12538,22 @@ impl ProcessManager {
             service_details.push(status);
         }
         let availability = match instance_id {
-            Some(instance_id) => self
-                .project_availability_status(instance_id, presence, &service_details)
+            Some(instance_id) => {
+                let runtime_identity = service_snapshot
+                    .runtime_identities
+                    .get(&instance_id)
+                    .cloned()
+                    .unwrap_or_else(|| AvailabilityRuntimeIdentity {
+                        configuration_revision: None,
+                        attempt_generation: 0,
+                        service_runtimes: BTreeMap::new(),
+                    });
+                self.project_availability_status_with_runtime_identity(
+                    instance_id,
+                    presence,
+                    &service_details,
+                    &runtime_identity,
+                )
                 .await?
                 .or_else(|| {
                     Some(Self::inactive_project_availability(
@@ -12407,7 +12562,8 @@ impl ProcessManager {
                         "No availability demand or policy has been recorded; run `locald up` to start the project."
                             .to_owned(),
                     ))
-                }),
+                })
+            }
             None => unresolved_reason.map(|(code, reason)| {
                 Self::inactive_project_availability(presence, code, reason.to_owned())
             }),
@@ -12445,11 +12601,12 @@ impl ProcessManager {
         all_projects.extend(attachment_snapshot.attachments.keys().cloned());
         all_projects.extend(attachment_snapshot.manually_stopped.iter().cloned());
 
-        let statuses = self.list_with_instance_owners(None).await;
+        let service_snapshot = self.list_with_instance_owner_snapshot(None).await;
+        let runtime_identities = service_snapshot.runtime_identities;
         let mut running_instances = HashSet::new();
         let mut statuses_by_instance = HashMap::<ProjectInstanceId, Vec<ServiceStatus>>::new();
 
-        for (instance_id, status) in statuses {
+        for (instance_id, status) in service_snapshot.entries {
             if status.status == ServiceState::Running {
                 running_instances.insert(instance_id);
             }
@@ -12510,8 +12667,21 @@ impl ProcessManager {
                 None => Vec::new(),
             };
             let availability = match instance_id {
-                Some(instance_id) => self
-                    .project_availability_status(instance_id, presence, &service_details)
+                Some(instance_id) => {
+                    let runtime_identity = runtime_identities
+                        .get(&instance_id)
+                        .cloned()
+                        .unwrap_or_else(|| AvailabilityRuntimeIdentity {
+                            configuration_revision: None,
+                            attempt_generation: 0,
+                            service_runtimes: BTreeMap::new(),
+                        });
+                    self.project_availability_status_with_runtime_identity(
+                        instance_id,
+                        presence,
+                        &service_details,
+                        &runtime_identity,
+                    )
                     .await?
                     .or_else(|| {
                         Some(Self::inactive_project_availability(
@@ -12520,7 +12690,8 @@ impl ProcessManager {
                             "No availability demand or policy has been recorded; run `locald up` to start the project."
                                 .to_owned(),
                         ))
-                    }),
+                    })
+                }
                 None => unresolved_reason.map(|(code, reason)| {
                     Self::inactive_project_availability(presence, code, reason.to_owned())
                 }),
@@ -14040,7 +14211,8 @@ impl ProcessManager {
                                 false,
                                 ConfigApplyOptions::start_all_with_readiness_timeout(
                                     options.service_readiness_timeout,
-                                    options.share_service_readiness_budget,
+                                    options.share_service_readiness_budget
+                                        && retry_claim.is_some(),
                                 ),
                             )
                             .await?;
@@ -24421,6 +24593,199 @@ PATH = "/usr/bin:/bin"
                 .last_convergence_error(),
             Some("seed late readiness failure"),
             "status becomes truthful before the immediate convergence pass clears durable history"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_attempt_generation_attributes_late_readiness_to_a_reused_runtime() {
+        let dir = tempdir().expect("create repeated attempt directory");
+        let project_path = dir.path().join("repeated-attempt-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "repeated-attempt",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load repeated attempt availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable repeated attempt Always On");
+
+        let mut service =
+            availability_test_service(instance_id, "repeated-attempt", &project_path, false);
+        service.controller_generation = 1;
+        service.sticky_port = Some(3000);
+        service.health_status = HealthStatus::Starting;
+        let controller = match &service.runtime_state {
+            ServiceRuntime::Controller(controller) => controller.clone(),
+            ServiceRuntime::None => panic!("repeated attempt fixture has a controller"),
+        };
+        let requirement =
+            ReadinessRequirement::for_service(&service.service_config, service.sticky_port)
+                .expect("derive repeated attempt readiness requirement");
+        manager
+            .services
+            .lock()
+            .await
+            .insert_display("repeated-attempt:web".to_owned(), service);
+
+        manager.advance_availability_runtime_attempt_generation(instance_id);
+        let first_identity = manager.availability_runtime_identity(instance_id).await;
+        manager
+            .finish_availability_action_locked(
+                &mut availability,
+                instance_id,
+                ConvergenceDecision::EnsureUp,
+                AvailabilityActionFinalization {
+                    result: Err(anyhow::anyhow!("first readiness timeout")),
+                    attempted_runtime_identity: Some(first_identity.clone()),
+                    clear_on_success: true,
+                },
+                None,
+            )
+            .await
+            .expect_err("record first readiness timeout");
+
+        let failed = availability
+            .snapshot()
+            .await
+            .expect("read first failed attempt");
+        assert!(matches!(
+            manager.availability_retry_attempt(
+                instance_id,
+                ConvergenceDecision::EnsureUp,
+                &failed,
+                AvailabilityRetryMode::Explicit,
+            ),
+            AvailabilityRetryAttempt::Proceed
+        ));
+        manager.advance_availability_runtime_attempt_generation(instance_id);
+        let second_identity = manager.availability_runtime_identity(instance_id).await;
+        assert_eq!(
+            second_identity.service_runtimes, first_identity.service_runtimes,
+            "the repeated attempt reuses the same controller projection"
+        );
+        assert_ne!(
+            second_identity.attempt_generation, first_identity.attempt_generation,
+            "a valid repeated runtime attempt receives an independent identity"
+        );
+        manager
+            .finish_availability_action_locked(
+                &mut availability,
+                instance_id,
+                ConvergenceDecision::EnsureUp,
+                AvailabilityActionFinalization {
+                    result: Err(anyhow::anyhow!("second readiness timeout")),
+                    attempted_runtime_identity: Some(second_identity),
+                    clear_on_success: true,
+                },
+                None,
+            )
+            .await
+            .expect_err("record second readiness timeout");
+
+        assert!(
+            manager
+                .publish_successful_readiness_probe("web", instance_id, &controller, &requirement)
+                .await,
+            "the reused runtime becomes ready after the second timeout"
+        );
+        let status = manager
+            .project_status(&project_path)
+            .await
+            .expect("read repeated attempt status")
+            .availability
+            .expect("repeated attempt availability status");
+        assert_eq!(status.state, ProjectLifecycleState::Ready);
+        assert_eq!(status.last_error, None);
+    }
+
+    #[tokio::test]
+    async fn availability_status_uses_the_runtime_identity_from_its_service_snapshot() {
+        let dir = tempdir().expect("create coherent status snapshot directory");
+        let project_path = dir.path().join("coherent-status-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "coherent-status",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load coherent status availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable coherent status Always On");
+
+        let mut prior_service =
+            availability_test_service(instance_id, "coherent-status", &project_path, false);
+        prior_service.controller_generation = 1;
+        prior_service.health_status = HealthStatus::Healthy;
+        manager
+            .services
+            .lock()
+            .await
+            .insert_display("coherent-status:web".to_owned(), prior_service);
+        let prior_snapshot = manager
+            .list_with_instance_owner_snapshot(Some(instance_id))
+            .await;
+        let prior_identity = prior_snapshot.runtime_identities[&instance_id].clone();
+        let prior_statuses = prior_snapshot
+            .entries
+            .into_iter()
+            .map(|(_, status)| status)
+            .collect::<Vec<_>>();
+
+        let mut replacement =
+            availability_test_service(instance_id, "coherent-status", &project_path, false);
+        replacement.controller_generation = 2;
+        replacement.health_status = HealthStatus::Starting;
+        manager
+            .services
+            .lock()
+            .await
+            .insert_display("coherent-status:web".to_owned(), replacement);
+        let replacement_identity = manager.availability_runtime_identity(instance_id).await;
+        manager
+            .finish_availability_action_locked(
+                &mut availability,
+                instance_id,
+                ConvergenceDecision::EnsureUp,
+                AvailabilityActionFinalization {
+                    result: Err(anyhow::anyhow!("replacement readiness timeout")),
+                    attempted_runtime_identity: Some(replacement_identity),
+                    clear_on_success: true,
+                },
+                None,
+            )
+            .await
+            .expect_err("record replacement readiness timeout");
+
+        let status = manager
+            .project_availability_status_with_runtime_identity(
+                instance_id,
+                CatalogPresence::Active,
+                &prior_statuses,
+                &prior_identity,
+            )
+            .await
+            .expect("assemble coherent availability status")
+            .expect("coherent availability status exists");
+        assert_eq!(status.state, ProjectLifecycleState::Failed);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("replacement readiness timeout"),
+            "a ready prior snapshot cannot borrow a newer replacement identity"
         );
     }
 
@@ -40407,6 +40772,102 @@ PATH = "/usr/bin:/bin"
                 .is_some(),
             "stopping the retained runtime releases its allocator reservation"
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_background_restoration_keeps_per_service_readiness_budgets() {
+        let dir = tempdir().expect("create ordinary restoration budget directory");
+        let project_path = dir.path().join("ordinary-restoration-budget-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (mut manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "ordinary-restoration-budget",
+            SharedAvailabilityClock::new(clock),
+        )
+        .await;
+        tokio::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "ordinary-restoration-budget"
+domain = "ordinary-restoration-budget.localhost"
+
+[services.db]
+type = "worker"
+command = "unused-by-test-factory"
+
+[services.db.env]
+PATH = "/usr/bin:/bin"
+
+[services.web]
+type = "worker"
+command = "unused-by-test-factory"
+depends_on = ["db"]
+health_check = "false"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
+"#,
+        )
+        .await
+        .expect("write ordinary restoration budget config");
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load ordinary restoration availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable ordinary restoration Always On");
+
+        let creates = Arc::new(AtomicUsize::new(0));
+        let prepare_entered = Arc::new(tokio::sync::Notify::new());
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+        manager.set_readiness_wait_hook(Arc::new(tokio::sync::Notify::new()));
+        manager.factories.insert(
+            0,
+            Arc::new(FirstPrepareDelayFactory {
+                creates: creates.clone(),
+                entered: prepare_entered.clone(),
+                release: release_prepare.clone(),
+            }),
+        );
+
+        let sweep = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.converge_all_project_availability().await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, prepare_entered.notified())
+            .await
+            .expect("ordinary restoration enters first preparation");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        release_prepare.notify_one();
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            while creates.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary restoration starts its dependent service");
+        let timeout = manager
+            .readiness_wait_timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("ordinary restoration enters readiness polling");
+        assert!(
+            timeout > Duration::from_secs(29),
+            "ordinary restoration gives each service a fresh readiness budget: {timeout:?}"
+        );
+        sweep.abort();
+        assert!(
+            sweep
+                .await
+                .expect_err("ordinary restoration sweep is cancelled")
+                .is_cancelled()
+        );
+        tokio::time::resume();
     }
 
     #[tokio::test]
