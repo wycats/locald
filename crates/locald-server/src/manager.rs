@@ -7854,7 +7854,10 @@ impl ProcessManager {
                 .await
                 .map(|_| ());
             let start = match start {
-                Ok(()) => self.finish_explicit_runtime_recovery(instance_id).await,
+                Ok(()) => {
+                    self.finish_explicit_runtime_recovery_if_ready(instance_id)
+                        .await
+                }
                 Err(error) => Err(error),
             };
             return Self::surface_availability_durability(start, durability_error);
@@ -8262,7 +8265,9 @@ impl ProcessManager {
             )
             .await
             .map(|_| ())?;
-            return self.finish_explicit_runtime_recovery(instance_id).await;
+            return self
+                .finish_explicit_runtime_recovery_if_ready(instance_id)
+                .await;
         }
     }
 
@@ -8481,7 +8486,8 @@ impl ProcessManager {
         )
         .await?;
 
-        Ok(())
+        self.finish_explicit_runtime_recovery_if_ready(instance_id)
+            .await
     }
 
     pub async fn list(&self) -> Vec<ServiceStatus> {
@@ -13718,6 +13724,17 @@ impl ProcessManager {
         Self::surface_availability_durability(Ok(()), durability_error)
     }
 
+    async fn finish_explicit_runtime_recovery_if_ready(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> Result<()> {
+        if self.project_runtime_is_fully_ready(instance_id).await {
+            self.finish_explicit_runtime_recovery(instance_id).await
+        } else {
+            Ok(())
+        }
+    }
+
     async fn availability_authorizes_start(&self, instance_id: ProjectInstanceId) -> Result<()> {
         let _publication_guard = self.lifecycle_publication_lock.lock().await;
         self.availability_authorizes_start_locked(instance_id).await
@@ -13847,6 +13864,20 @@ impl ProcessManager {
             .filter(|key| key.instance() == instance_id)
             .cloned()
             .collect::<HashSet<_>>();
+        self.project_runtime_is_ready_except(instance_id, &suppressed)
+            .await
+    }
+
+    async fn project_runtime_is_fully_ready(&self, instance_id: ProjectInstanceId) -> bool {
+        self.project_runtime_is_ready_except(instance_id, &HashSet::new())
+            .await
+    }
+
+    async fn project_runtime_is_ready_except(
+        &self,
+        instance_id: ProjectInstanceId,
+        suppressed: &HashSet<ServiceKey>,
+    ) -> bool {
         let runtimes = {
             let services = self.services.lock().await;
             services
@@ -14643,9 +14674,7 @@ impl ProcessManager {
                 } else {
                     None
                 };
-                if recovery_identity.is_some() || retry_claim.is_none() {
-                    self.set_availability_runtime_recovery_identity(instance_id, recovery_identity);
-                }
+                self.set_availability_runtime_recovery_identity(instance_id, recovery_identity);
                 let message = format!("{error:#}");
                 let publication = availability.record_convergence_error(message).await;
                 self.finish_failed_availability_action(
@@ -26359,6 +26388,89 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
+    async fn claimed_retry_failure_replaces_a_stale_runtime_recovery_identity() {
+        let dir = tempdir().expect("create claimed retry recovery directory");
+        let project_path = dir.path().join("claimed-retry-recovery-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "claimed-retry-recovery",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        manager.services.lock().await.insert_display(
+            "claimed-retry-recovery:web",
+            availability_test_service(instance_id, "claimed-retry-recovery", &project_path, false),
+        );
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load claimed retry recovery availability");
+        availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("seed claimed retry recovery demand");
+        availability
+            .record_convergence_error("timed-out runtime".to_owned())
+            .await
+            .expect("seed claimed retry recovery failure");
+        manager.record_availability_retry_failure(instance_id);
+        let stale_recovery_identity = manager.availability_runtime_identity(instance_id).await;
+        manager.set_availability_runtime_recovery_identity(
+            instance_id,
+            Some(stale_recovery_identity.clone()),
+        );
+        clock.advance(Duration::from_secs(30));
+        let snapshot = availability
+            .snapshot()
+            .await
+            .expect("read claimed retry recovery availability");
+        let mut claim = match manager.availability_retry_attempt(
+            instance_id,
+            ConvergenceDecision::EnsureUp,
+            &snapshot,
+            AvailabilityRetryMode::Automatic,
+        ) {
+            AvailabilityRetryAttempt::Claimed(claim) => claim,
+            other => panic!("expected automatic retry claim, got {other:?}"),
+        };
+
+        manager
+            .finish_availability_action_locked(
+                &mut availability,
+                instance_id,
+                ConvergenceDecision::EnsureUp,
+                AvailabilityActionFinalization {
+                    result: Err(anyhow::anyhow!("replacement configuration is invalid")),
+                    attempted_runtime_identity: None,
+                    clear_on_success: true,
+                },
+                Some(&mut claim),
+            )
+            .await
+            .expect_err("the claimed retry records its fresh failure");
+        drop(claim);
+
+        assert!(
+            !manager.availability_runtime_recovery_matches(instance_id, &stale_recovery_identity),
+            "the prior late-readiness identity cannot mask the current pre-runtime failure"
+        );
+        assert_eq!(
+            availability
+                .snapshot()
+                .await
+                .expect("read replacement convergence failure")
+                .last_convergence_error(),
+            Some("replacement configuration is invalid")
+        );
+        assert_eq!(
+            manager.availability_retry_deadline(instance_id),
+            Some(clock.time() + Duration::from_mins(1))
+        );
+    }
+
+    #[tokio::test]
     async fn published_but_not_durable_failure_advances_automatic_retry_bookkeeping() {
         let dir = tempdir().expect("create partial-durability retry directory");
         let project_path = dir.path().join("partial-durability-retry-project");
@@ -30478,7 +30590,6 @@ PATH = "/usr/bin:/bin"
                 .last_convergence_error()
                 .is_some()
         );
-
         clock.advance(Duration::from_secs(30));
         assert_eq!(
             manager
@@ -30501,6 +30612,85 @@ PATH = "/usr/bin:/bin"
             .project_pause_availability(&project_path)
             .await
             .expect("clean up retry runtimes");
+    }
+
+    #[tokio::test]
+    async fn targeted_service_start_retains_an_unrelated_service_failure() {
+        let dir = tempdir().expect("create targeted service recovery directory");
+        let project_path = dir.path().join("targeted-service-recovery-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (mut manager, instance_id, availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "targeted-service-recovery",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "targeted-service-recovery",
+            "targeted-service-recovery.localhost",
+            &["first", "second"],
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load targeted service recovery availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable targeted service recovery Always On");
+        manager
+            .converge_project_availability(&project_path)
+            .await
+            .expect("start targeted service recovery fixture");
+        manager
+            .stop("targeted-service-recovery:second")
+            .await
+            .expect("stop the unrelated service before its failure is recorded");
+        availability
+            .record_convergence_error("second service is unhealthy".to_owned())
+            .await
+            .expect("seed unrelated service failure");
+        manager.record_availability_retry_failure(instance_id);
+        let retry_before_targeted_start = manager
+            .availability_retries
+            .lock()
+            .expect("retry state mutex poisoned")[&instance_id];
+
+        manager
+            .start_service("targeted-service-recovery:first")
+            .await
+            .expect("start the healthy service closure");
+
+        assert_eq!(
+            availability
+                .snapshot()
+                .await
+                .expect("reload failure after targeted start")
+                .last_convergence_error(),
+            Some("second service is unhealthy"),
+            "starting one healthy closure retains the unrelated service failure"
+        );
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")[&instance_id],
+            retry_before_targeted_start,
+            "targeted service activity retains the unrelated retry schedule"
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up targeted service recovery runtimes");
     }
 
     #[tokio::test]
@@ -42670,6 +42860,32 @@ domains = ["workbench"]
                 .snapshot()
                 .await
                 .expect("read service start recovery")
+                .last_convergence_error(),
+            None
+        );
+        assert!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(&instance_id)
+                .is_none()
+        );
+
+        availability
+            .record_convergence_error("stale service reset failure".to_owned())
+            .await
+            .expect("seed service reset failure");
+        manager.record_availability_retry_failure(instance_id);
+        manager
+            .reset("explicit-recovery:web")
+            .await
+            .expect("reset service successfully");
+        assert_eq!(
+            availability
+                .snapshot()
+                .await
+                .expect("read service reset recovery")
                 .last_convergence_error(),
             None
         );
