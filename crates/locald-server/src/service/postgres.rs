@@ -71,6 +71,7 @@ impl ServiceController for PostgresController {
                     service: service_name.clone(),
                     instance_id: None,
                     service_name: None,
+                    service_domain: None,
                     stream: if stream_name == "stderr" { LogStream::Stderr } else { LogStream::Stdout },
                     message: line,
                 };

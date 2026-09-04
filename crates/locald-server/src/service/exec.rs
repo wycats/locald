@@ -287,6 +287,7 @@ impl ServiceController for ExecController {
                                 service: id,
                                 instance_id: None,
                                 service_name: None,
+                                service_domain: None,
                                 stream: LogStream::Stdout,
                                 message: line,
                             });

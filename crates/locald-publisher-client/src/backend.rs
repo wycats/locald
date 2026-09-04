@@ -1745,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn unix_transport_rejects_response_descriptors_and_trailing_bytes() {
+    fn unix_transport_rejects_response_descriptors() {
         let (_directory, socket, listener) = publisher_listener();
         let response = release_response();
         let file = File::open("/dev/null").expect("open descriptor fixture");
@@ -1755,13 +1755,18 @@ mod tests {
             assert_eq!(request, release_frame().as_bytes());
             assert!(descriptors.is_empty());
 
+            let last = response.len() - 1;
+            let mut stream = stream;
+            stream
+                .write_all(&response[..last])
+                .expect("send response before unexpected descriptor");
             let descriptors = [file.as_raw_fd()];
             let control = [ControlMessage::ScmRights(&descriptors)];
-            let first = [IoSlice::new(&response[..1])];
+            let final_byte = [IoSlice::new(&response[last..])];
             assert_eq!(
                 sendmsg::<UnixAddr>(
                     stream.as_raw_fd(),
-                    &first,
+                    &final_byte,
                     &control,
                     MsgFlags::empty(),
                     None,
@@ -1769,14 +1774,6 @@ mod tests {
                 .expect("send unexpected response descriptor"),
                 1
             );
-            let mut stream = stream;
-            if let Err(error) = stream.write_all(&response[1..]) {
-                assert_eq!(
-                    error.kind(),
-                    std::io::ErrorKind::BrokenPipe,
-                    "only the client's expected early rejection may stop the fixture write"
-                );
-            }
         });
         let failure = UnixPublisherTransport
             .exchange(&socket, &release_frame(), None)
@@ -1784,7 +1781,10 @@ mod tests {
         assert_eq!(failure.certainty, DeliveryCertainty::OutcomeUnknown);
         assert_eq!(failure.error.kind, BackendErrorKind::Protocol);
         server.join().expect("publisher server");
+    }
 
+    #[test]
+    fn unix_transport_rejects_trailing_bytes() {
         let (_directory, socket, listener) = publisher_listener();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept publisher connection");

@@ -181,8 +181,14 @@ function openEventSource() {
 	eventSource.onmessage = (event) => {
 		try {
 			const msg = JSON.parse(event.data);
-			if (msg.type === 'Log') {
+			if (msg.type === 'LogReplayStarted') {
+				logs.beginReplay();
+			} else if (msg.type === 'Log') {
 				logs.addLog(msg.data);
+			} else if (msg.type === 'LogReplayFinished') {
+				logs.finishReplay();
+			} else if (msg.type === 'LogInstanceRetired') {
+				logs.retireInstance(msg.data);
 			} else if (msg.type === 'ServiceUpdate') {
 				console.log('Received ServiceUpdate:', msg.data.name, msg.data.status);
 				services.updateService(msg.data);

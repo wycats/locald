@@ -102,7 +102,7 @@ impl MacOsAuditToken {
         let mut words = [0_u32; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES / size_of::<u32>()];
         for (word, bytes) in words
             .iter_mut()
-            .zip(self.0.as_chunks::<{ size_of::<u32>() }>().0.iter())
+            .zip(self.0.as_chunks::<{ size_of::<u32>() }>().0)
         {
             *word = u32::from_ne_bytes(*bytes);
         }

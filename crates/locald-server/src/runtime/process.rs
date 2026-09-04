@@ -625,6 +625,7 @@ impl ProcessRuntime {
                                     service: service_name.clone(),
                                     instance_id: None,
                                     service_name: None,
+                                    service_domain: None,
                                     stream: LogStream::Stdout,
                                     message: line,
                                 };

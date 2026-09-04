@@ -669,6 +669,22 @@ impl Drop for ProjectionWriteProbeCleanup<'_> {
 }
 
 fn verify_projection_parent_write(parent: &Dir) -> Result<()> {
+    verify_projection_parent_write_with_operations(
+        parent,
+        set_projection_provenance,
+        rename_projection_noreplace,
+    )
+}
+
+fn verify_projection_parent_write_with_operations<F, G>(
+    parent: &Dir,
+    bind_provenance: F,
+    rename: G,
+) -> Result<()>
+where
+    F: FnOnce(&cap_std::fs::File, &str) -> Result<()>,
+    G: FnOnce(&Dir, &Path, &Dir, &Path) -> std::io::Result<()>,
+{
     let name = PathBuf::from(format!(
         ".locald-projection-write-probe-{}",
         uuid::Uuid::new_v4()
@@ -680,15 +696,35 @@ fn verify_projection_parent_write(parent: &Dir) -> Result<()> {
         .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     let probe = parent.open_with(&name, &options)?;
-    drop(probe);
-
     let mut cleanup = ProjectionWriteProbeCleanup {
         parent,
         name: &name,
         removed: false,
     };
-    parent.remove_file(&name)?;
+
+    // Exercise the inode provenance and atomic cleanup primitives before a
+    // healthy service is stopped. File creation alone does not establish
+    // support for either operation on this project filesystem.
+    let projection_id = uuid::Uuid::new_v4().to_string();
+    bind_provenance(&probe, &projection_id)?;
+    anyhow::ensure!(
+        projection_provenance_matches(&probe, &projection_id)?,
+        "generated-file project_path provenance probe did not round-trip"
+    );
+    let quarantine_name = PathBuf::from(format!(
+        ".locald-projection-quarantine-probe-{}",
+        uuid::Uuid::new_v4()
+    ));
+    rename(parent, &name, parent, &quarantine_name)
+        .context("generated-file project_path requires atomic no-replace quarantine support")?;
     cleanup.removed = true;
+    let mut quarantine_cleanup = ProjectionWriteProbeCleanup {
+        parent,
+        name: &quarantine_name,
+        removed: false,
+    };
+    parent.remove_file(&quarantine_name)?;
+    quarantine_cleanup.removed = true;
     Ok(())
 }
 
@@ -4279,6 +4315,82 @@ mod tests {
                 .is_none(),
             "the write probe leaves no project entry behind"
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn projection_preflight_exercises_provenance_and_atomic_quarantine() {
+        let root = tempdir().expect("create projection capability root");
+        let parent = Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open parent");
+        verify_projection_parent_write(&parent).expect("supported filesystem passes preflight");
+        assert_eq!(parent.entries().expect("inspect probe cleanup").count(), 0);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn projection_preflight_rejects_unsupported_provenance_and_cleans_probe() {
+        let root = tempdir().expect("create unsupported provenance root");
+        let parent = Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open parent");
+        let error = verify_projection_parent_write_with_operations(
+            &parent,
+            |_, _| Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP).into()),
+            |_, _, _, _| unreachable!("quarantine follows successful provenance verification"),
+        )
+        .expect_err("unsupported xattrs reject projection admission");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(libc::EOPNOTSUPP)
+        );
+        assert_eq!(parent.entries().expect("inspect probe cleanup").count(), 0);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn projection_preflight_verifies_provenance_round_trip() {
+        let root = tempdir().expect("create mismatched provenance root");
+        let parent = Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open parent");
+        let error = verify_projection_parent_write_with_operations(
+            &parent,
+            |file, _| set_projection_provenance(file, "different-projection"),
+            |_, _, _, _| unreachable!("quarantine follows successful provenance verification"),
+        )
+        .expect_err("mismatched provenance rejects projection admission");
+        assert!(
+            error
+                .to_string()
+                .contains("provenance probe did not round-trip")
+        );
+        assert_eq!(parent.entries().expect("inspect probe cleanup").count(), 0);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn projection_preflight_rejects_unavailable_atomic_quarantine_and_cleans_probe() {
+        for errno in [libc::ENOSYS, libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
+            let root = tempdir().expect("create unsupported quarantine root");
+            let parent =
+                Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open parent");
+            let error = verify_projection_parent_write_with_operations(
+                &parent,
+                set_projection_provenance,
+                |_, _, _, _| Err(std::io::Error::from_raw_os_error(errno)),
+            )
+            .expect_err("unavailable atomic rename rejects projection admission");
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires atomic no-replace quarantine support")
+            );
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error),
+                Some(errno)
+            );
+            assert_eq!(parent.entries().expect("inspect probe cleanup").count(), 0);
+        }
     }
 
     #[cfg(target_os = "linux")]

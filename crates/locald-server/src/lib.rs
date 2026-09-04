@@ -1060,7 +1060,17 @@ async fn async_main(
     let manager_reaper = manager.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            manager_reaper.wait_for_availability_maintenance().await;
+            if manager_reaper.is_shutting_down() {
+                break;
+            }
+            // The wake may be an advertised retry deadline. Dispatch only due
+            // retries before orphan reaping, which can wait behind a
+            // foreground attachment transition for an unbounded interval.
+            // The global lease sweep follows compatibility-owner revalidation.
+            let retry_dispatch = manager_reaper
+                .converge_due_project_availability_retries()
+                .await;
             if manager_reaper.is_shutting_down() {
                 break;
             }
@@ -1068,7 +1078,12 @@ async fn async_main(
             if manager_reaper.is_shutting_down() {
                 break;
             }
-            manager_reaper.converge_all_project_availability().await;
+            // Keep retry claims withheld through the global sweep. This keeps
+            // later queued retries from becoming due again while an earlier
+            // ordinary lifecycle convergence is still running.
+            manager_reaper
+                .converge_all_project_availability_after_retry_dispatch(retry_dispatch)
+                .await;
         }
     });
 

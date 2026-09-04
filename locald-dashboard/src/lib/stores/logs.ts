@@ -1,58 +1,139 @@
-import { writable } from 'svelte/store';
+import { derived, writable } from 'svelte/store';
 import { logIdentity, type LogEntry } from '$lib/types';
 
-const MAX_LOGS = 1000; // Keep last 1000 logs per service for mini-log
-const MAX_STREAM_LOGS = 5000; // Keep last 5000 logs for the main stream
+const MAX_LOGS = 1000;
+const MAX_STREAM_LOGS = 5000;
 
-export const latestLog = writable<LogEntry | null>(null);
+export interface LogHistory {
+	recent: LogEntry[];
+	live: LogEntry[];
+}
 
-function createStreamStore() {
-	const { subscribe, update, set } = writable<LogEntry[]>([]);
+interface LogState {
+	stream: LogHistory;
+	byService: Record<string, LogHistory>;
+}
 
+type LogListener = (entry: LogEntry) => void;
+type StateChangeListener = () => void;
+
+const emptyHistory = (): LogHistory => ({ recent: [], live: [] });
+const state = writable<LogState>({ stream: emptyHistory(), byService: {} });
+const liveListeners = new Set<LogListener>();
+const stateChangeListeners = new Set<StateChangeListener>();
+let replayBuffer: LogEntry[] | null = null;
+
+function appendBounded(entries: LogEntry[], entry: LogEntry, capacity: number): LogEntry[] {
+	const next = [...entries, entry];
+	return next.length > capacity ? next.slice(next.length - capacity) : next;
+}
+
+function historyFrom(entries: LogEntry[], capacity: number): LogHistory {
+	return { recent: entries.slice(-capacity), live: [] };
+}
+
+function appendLive(history: LogHistory, entry: LogEntry, capacity: number): LogHistory {
+	let recent = history.recent;
+	let live = appendBounded(history.live, entry, capacity);
+	let overflow = recent.length + live.length - capacity;
+	if (overflow > 0) {
+		const recentEviction = Math.min(overflow, recent.length);
+		recent = recent.slice(recentEviction);
+		overflow -= recentEviction;
+		if (overflow > 0) live = live.slice(overflow);
+	}
+	return { recent, live };
+}
+
+function withoutInstance(history: LogHistory, instanceId: string): LogHistory {
 	return {
-		subscribe,
-		set,
-		addLog: (entry: LogEntry) => {
-			update((logs) => {
-				const newLogs = [...logs, entry];
-				if (newLogs.length > MAX_STREAM_LOGS) {
-					newLogs.shift();
-				}
-				return newLogs;
-			});
-		},
-		clear: () => set([])
+		recent: history.recent.filter((entry) => entry.instance_id !== instanceId),
+		live: history.live.filter((entry) => entry.instance_id !== instanceId)
 	};
 }
 
-export const stream = createStreamStore();
-
-function createLogsStore() {
-	const { subscribe, update } = writable<Record<string, LogEntry[]>>({});
+function stateFromReplay(entries: LogEntry[]): LogState {
+	const byServiceEntries: Record<string, LogEntry[]> = {};
+	for (const entry of entries) {
+		const identity = logIdentity(entry);
+		byServiceEntries[identity] = appendBounded(byServiceEntries[identity] ?? [], entry, MAX_LOGS);
+	}
 
 	return {
-		subscribe,
-		addLog: (entry: LogEntry) => {
-			latestLog.set(entry);
+		stream: historyFrom(entries, MAX_STREAM_LOGS),
+		byService: Object.fromEntries(
+			Object.entries(byServiceEntries).map(([identity, serviceEntries]) => [
+				identity,
+				historyFrom(serviceEntries, MAX_LOGS)
+			])
+		)
+	};
+}
 
-			// Update per-service logs
-			update((logs) => {
-				const identity = logIdentity(entry);
-				const serviceLogs = logs[identity] || [];
-				const newLogs = [...serviceLogs, entry];
-				if (newLogs.length > MAX_LOGS) {
-					newLogs.shift();
-				}
-				return {
-					...logs,
-					[identity]: newLogs
-				};
-			});
+export const stream = derived(state, ($state) => $state.stream);
+const serviceLogs = derived(state, ($state) => $state.byService);
 
-			// Update the unified stream
-			stream.addLog(entry);
+export const liveLogs = {
+	subscribe(listener: LogListener) {
+		liveListeners.add(listener);
+		return () => liveListeners.delete(listener);
+	}
+};
+
+export const logStateChanged = {
+	subscribe(listener: StateChangeListener) {
+		stateChangeListeners.add(listener);
+		return () => stateChangeListeners.delete(listener);
+	}
+};
+
+export const logs = {
+	subscribe: serviceLogs.subscribe,
+	beginReplay() {
+		replayBuffer = [];
+	},
+	addLog(entry: LogEntry) {
+		if (replayBuffer) {
+			replayBuffer.push(entry);
+			return;
 		}
-	};
-}
 
-export const logs = createLogsStore();
+		state.update((current) => {
+			const identity = logIdentity(entry);
+			const serviceHistory = current.byService[identity] ?? emptyHistory();
+			return {
+				stream: appendLive(current.stream, entry, MAX_STREAM_LOGS),
+				byService: {
+					...current.byService,
+					[identity]: appendLive(serviceHistory, entry, MAX_LOGS)
+				}
+			};
+		});
+		for (const listener of liveListeners) listener(entry);
+	},
+	finishReplay() {
+		if (!replayBuffer) return;
+		state.set(stateFromReplay(replayBuffer));
+		replayBuffer = null;
+		for (const listener of stateChangeListeners) listener();
+	},
+	retireInstance(instanceId: string) {
+		state.update((current) => {
+			const byService = Object.fromEntries(
+				Object.entries(current.byService).flatMap(([identity, history]) => {
+					const retained = withoutInstance(history, instanceId);
+					return retained.recent.length + retained.live.length > 0 ? [[identity, retained]] : [];
+				})
+			);
+			return {
+				stream: withoutInstance(current.stream, instanceId),
+				byService
+			};
+		});
+		for (const listener of stateChangeListeners) listener();
+	},
+	clear() {
+		replayBuffer = null;
+		state.set({ stream: emptyHistory(), byService: {} });
+	}
+};
