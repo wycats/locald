@@ -235,12 +235,16 @@ struct AvailabilityRetryState {
 #[derive(Debug)]
 struct AvailabilityRetryClaim {
     retries: Arc<StdMutex<HashMap<ProjectInstanceId, AvailabilityRetryState>>>,
+    runtime_recovery_identities:
+        Arc<StdMutex<HashMap<ProjectInstanceId, AvailabilityRuntimeIdentity>>>,
     retry_changed: Arc<Notify>,
     event_sender: broadcast::Sender<Event>,
     clock: SharedAvailabilityClock,
     instance_id: ProjectInstanceId,
     failure_count: usize,
     restore_delay: std::time::Duration,
+    detached_retry: Option<AvailabilityRetryState>,
+    detached_recovery_identity: Option<AvailabilityRuntimeIdentity>,
     armed: bool,
 }
 
@@ -259,15 +263,44 @@ impl Drop for AvailabilityRetryClaim {
             .retries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(retry) = retries.get_mut(&self.instance_id) else {
-            return;
+        let restored = if let Some(detached_retry) = self.detached_retry.take() {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                retries.entry(self.instance_id)
+            {
+                entry.insert(detached_retry);
+                true
+            } else {
+                false
+            }
+        } else if let Some(retry) = retries.get_mut(&self.instance_id) {
+            let restored =
+                retry.failure_count == self.failure_count && retry.next_attempt_at.is_none();
+            if restored {
+                retry.next_attempt_at = Some(self.clock.now() + self.restore_delay);
+            }
+            restored
+        } else {
+            false
         };
-        let restored = retry.failure_count == self.failure_count && retry.next_attempt_at.is_none();
-        if restored {
-            retry.next_attempt_at = Some(self.clock.now() + self.restore_delay);
-        }
         drop(retries);
-        if restored {
+        let recovery_restored =
+            self.detached_recovery_identity
+                .take()
+                .is_some_and(|recovery_identity| {
+                    let mut recoveries = self
+                        .runtime_recovery_identities
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        recoveries.entry(self.instance_id)
+                    {
+                        entry.insert(recovery_identity);
+                        true
+                    } else {
+                        false
+                    }
+                });
+        if restored || recovery_restored {
             self.retry_changed.notify_one();
             let _ = self.event_sender.send(Event::ServiceListChanged);
         }
@@ -276,7 +309,7 @@ impl Drop for AvailabilityRetryClaim {
 
 pub(crate) struct AvailabilityRetryDispatch {
     retry_instances_seen: HashSet<ProjectInstanceId>,
-    _queued_retries: Vec<AvailabilityRetryClaim>,
+    queued_retries: Vec<AvailabilityRetryClaim>,
 }
 
 #[derive(Debug)]
@@ -1620,12 +1653,17 @@ impl ProcessManager {
                 retry.next_attempt_at = None;
                 AvailabilityRetryAttempt::Claimed(AvailabilityRetryClaim {
                     retries: self.availability_retries.clone(),
+                    runtime_recovery_identities: self
+                        .availability_runtime_recovery_identity
+                        .clone(),
                     retry_changed: self.availability_retry_changed.clone(),
                     event_sender: self.event_sender.clone(),
                     clock: self.availability_clock.clone(),
                     instance_id,
                     failure_count,
                     restore_delay: Self::availability_retry_delay(failure_count),
+                    detached_retry: None,
+                    detached_recovery_identity: None,
                     armed: true,
                 })
             }
@@ -1663,14 +1701,53 @@ impl ProcessManager {
         }
         failure_count.map(|failure_count| AvailabilityRetryClaim {
             retries: self.availability_retries.clone(),
+            runtime_recovery_identities: self.availability_runtime_recovery_identity.clone(),
             retry_changed: self.availability_retry_changed.clone(),
             event_sender: self.event_sender.clone(),
             clock: self.availability_clock.clone(),
             instance_id,
             failure_count,
             restore_delay: AVAILABILITY_BUSY_RETRY_DELAY,
+            detached_retry: None,
+            detached_recovery_identity: None,
             armed: true,
         })
+    }
+
+    fn reset_availability_retry_for_explicit_attempt(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> AvailabilityRetryClaim {
+        let prior_retry = self
+            .availability_retries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&instance_id);
+        let recovery_identity = self
+            .availability_runtime_recovery_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&instance_id);
+        if prior_retry.is_some() || recovery_identity.is_some() {
+            self.notify_availability_retry_changed();
+        }
+        let detached_retry = prior_retry.unwrap_or_else(|| AvailabilityRetryState {
+            failure_count: 1,
+            next_attempt_at: Some(self.availability_now() + Self::availability_retry_delay(1)),
+        });
+        AvailabilityRetryClaim {
+            retries: self.availability_retries.clone(),
+            runtime_recovery_identities: self.availability_runtime_recovery_identity.clone(),
+            retry_changed: self.availability_retry_changed.clone(),
+            event_sender: self.event_sender.clone(),
+            clock: self.availability_clock.clone(),
+            instance_id,
+            failure_count: detached_retry.failure_count,
+            restore_delay: std::time::Duration::ZERO,
+            detached_retry: Some(detached_retry),
+            detached_recovery_identity: recovery_identity,
+            armed: true,
+        }
     }
 
     fn availability_retry_deadline(&self, instance_id: ProjectInstanceId) -> Option<SystemTime> {
@@ -1758,8 +1835,9 @@ impl ProcessManager {
             retry_mode,
             AvailabilityRetryMode::Explicit | AvailabilityRetryMode::ConfigurationChange
         ) {
-            self.clear_availability_retry(instance_id);
-            return AvailabilityRetryAttempt::Proceed;
+            return AvailabilityRetryAttempt::Claimed(
+                self.reset_availability_retry_for_explicit_attempt(instance_id),
+            );
         }
         self.automatic_availability_retry_attempt(instance_id)
     }
@@ -13147,9 +13225,9 @@ impl ProcessManager {
     async fn reconcile_legacy_attachment_owners_for_instances(
         &self,
         instance_ids: &HashSet<ProjectInstanceId>,
-    ) -> Result<()> {
+    ) -> HashSet<ProjectInstanceId> {
         if self.is_shutting_down() || instance_ids.is_empty() {
-            return Ok(());
+            return HashSet::new();
         }
         let project_paths = {
             let attachments = self.attachments.lock().await;
@@ -13158,24 +13236,21 @@ impl ProcessManager {
                 .instance_owners
                 .iter()
                 .filter(|(_, instance_id)| instance_ids.contains(instance_id))
-                .map(|(project_path, _)| project_path.clone())
+                .map(|(project_path, instance_id)| (*instance_id, project_path.clone()))
                 .collect::<Vec<_>>()
         };
 
-        let mut failures = Vec::new();
-        for path in project_paths {
+        let mut failed_instances = HashSet::new();
+        for (instance_id, path) in project_paths {
             if let Err(error) = self.reconcile_legacy_attachment_project(path.clone()).await {
-                failures.push(format!("`{}`: {error:#}", path.display()));
+                failed_instances.insert(instance_id);
+                warn!(
+                    "Failed to revalidate due-retry project attachment `{}`: {error:#}",
+                    path.display()
+                );
             }
         }
-        if !failures.is_empty() {
-            anyhow::bail!(
-                "failed to reconcile {} due-retry attachment project(s): {}",
-                failures.len(),
-                failures.join("; ")
-            );
-        }
-        Ok(())
+        failed_instances
     }
 
     pub async fn reap_and_stop_orphans(&self) {
@@ -13249,7 +13324,7 @@ impl ProcessManager {
         if self.is_shutting_down() {
             return AvailabilityRetryDispatch {
                 retry_instances_seen: HashSet::new(),
-                _queued_retries: Vec::new(),
+                queued_retries: Vec::new(),
             };
         }
         let instance_ids = {
@@ -13258,22 +13333,22 @@ impl ProcessManager {
         };
         let due_instance_ids = self.due_availability_retry_instance_ids(&instance_ids);
         let due_instance_set = due_instance_ids.iter().copied().collect::<HashSet<_>>();
-        if let Err(error) = self
+        let failed_revalidations = self
             .reconcile_legacy_attachment_owners_for_instances(&due_instance_set)
-            .await
-        {
-            warn!("Failed to revalidate due-retry project attachments: {error:#}");
-            for instance_id in due_instance_ids {
-                self.defer_overdue_availability_retry(instance_id);
-            }
-            return AvailabilityRetryDispatch {
-                retry_instances_seen: due_instance_set,
-                _queued_retries: Vec::new(),
-            };
-        }
-        let dispatch = self
-            .converge_due_project_availability_retries_for(&due_instance_ids)
             .await;
+        let eligible_instance_ids = due_instance_ids
+            .into_iter()
+            .filter(|instance_id| !failed_revalidations.contains(instance_id))
+            .collect::<Vec<_>>();
+        let mut dispatch = self
+            .converge_due_project_availability_retries_for(&eligible_instance_ids)
+            .await;
+        for instance_id in failed_revalidations {
+            dispatch.retry_instances_seen.insert(instance_id);
+            if let Some(claim) = self.queue_overdue_availability_retry(instance_id) {
+                dispatch.queued_retries.push(claim);
+            }
+        }
         for instance_id in dispatch.retry_instances_seen.iter().copied() {
             self.converge_background_availability_lifecycle_only(instance_id)
                 .await;
@@ -13358,16 +13433,19 @@ impl ProcessManager {
                 .await;
             queued_retries
         } else {
+            let mut queued_retries = Vec::new();
             for instance_id in skipped_busy_retries {
                 retry_instances_seen_this_sweep.insert(instance_id);
-                self.defer_overdue_availability_retry(instance_id);
+                if let Some(claim) = self.queue_overdue_availability_retry(instance_id) {
+                    queued_retries.push(claim);
+                }
             }
-            Vec::new()
+            queued_retries
         };
 
         AvailabilityRetryDispatch {
             retry_instances_seen: retry_instances_seen_this_sweep,
-            _queued_retries: queued_retries,
+            queued_retries,
         }
     }
 
@@ -21257,6 +21335,117 @@ domains = ["retained"]
     }
 
     #[tokio::test]
+    async fn failed_owner_revalidation_does_not_defer_an_unrelated_due_retry() {
+        let dir = tempdir().expect("create isolated owner-revalidation directory");
+        let broken_path = dir.path().join("broken-owner-retry-project");
+        let healthy_path = dir.path().join("healthy-retry-project");
+        std::fs::create_dir_all(&broken_path).expect("create broken retry project");
+        std::fs::create_dir_all(&healthy_path).expect("create healthy retry project");
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let broken_instance = catalog
+            .register_project(
+                Registry::discover(
+                    std::fs::canonicalize(&broken_path).expect("canonical broken retry project"),
+                )
+                .await
+                .expect("discover broken retry project"),
+                Some("broken-owner-retry".to_owned()),
+            )
+            .expect("register broken retry project");
+        let healthy_instance = catalog
+            .register_project(
+                Registry::discover(
+                    std::fs::canonicalize(&healthy_path).expect("canonical healthy retry project"),
+                )
+                .await
+                .expect("discover healthy retry project"),
+                Some("healthy-retry".to_owned()),
+            )
+            .expect("register healthy retry project");
+        catalog.save().await.expect("save retry catalog");
+        let availability_data_dir = dir.path().join("availability-data");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let mut manager = ProcessManager::new_with_availability_data_dir_and_clock(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+            availability_data_dir.clone(),
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .expect("create isolated owner-revalidation manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        manager
+            .lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), clock.time())
+            .await
+            .expect("seed completed migration authority");
+
+        for instance_id in [broken_instance, healthy_instance] {
+            let mut availability = AvailabilityStore::load_with_clock(
+                &availability_data_dir,
+                instance_id,
+                SharedAvailabilityClock::new(clock.clone()),
+            )
+            .await
+            .expect("load isolated retry availability");
+            availability
+                .ensure_demand(DemandKey::manual_cli())
+                .await
+                .expect("seed isolated retry demand");
+            availability
+                .record_convergence_error("seed isolated retry failure".to_owned())
+                .await
+                .expect("seed isolated retry failure");
+            manager.record_availability_retry_failure(instance_id);
+        }
+
+        let source = AttachmentSource::CLI {
+            pid: std::process::id(),
+        };
+        {
+            let mut attachments = manager.attachments.lock().await;
+            attachments.replace_project(
+                &broken_path,
+                vec![Attachment {
+                    project_path: broken_path.clone(),
+                    source,
+                    created_at: clock.time(),
+                }],
+                false,
+            );
+            attachments.set_instance_owner(&broken_path, broken_instance);
+        }
+        std::fs::write(
+            availability_path(&availability_data_dir, broken_instance),
+            "{invalid",
+        )
+        .expect("make one due retry's availability unreadable");
+        std::fs::remove_dir_all(&healthy_path).expect("make healthy retry fail promptly");
+        clock.advance(Duration::from_secs(30));
+
+        let dispatch = manager.converge_due_project_availability_retries().await;
+
+        let retries = manager
+            .availability_retries
+            .lock()
+            .expect("retry state mutex poisoned");
+        assert_eq!(retries[&healthy_instance].failure_count, 2);
+        assert_eq!(retries[&broken_instance].failure_count, 1);
+        assert_eq!(retries[&broken_instance].next_attempt_at, None);
+        drop(retries);
+        drop(dispatch);
+        assert_eq!(
+            manager.availability_retry_deadline(broken_instance),
+            Some(clock.time() + AVAILABILITY_BUSY_RETRY_DELAY),
+            "only the failed owner revalidation is deferred after maintenance"
+        );
+    }
+
+    #[tokio::test]
     async fn queued_retry_deadline_stays_withheld_through_global_sweep() {
         let dir = tempdir().expect("create queued retry dispatch directory");
         let first_path = dir.path().join("first-retry-project");
@@ -25115,15 +25304,24 @@ PATH = "/usr/bin:/bin"
             .snapshot()
             .await
             .expect("read first failed attempt");
-        assert!(matches!(
-            manager.availability_retry_attempt(
-                instance_id,
-                ConvergenceDecision::EnsureUp,
-                &failed,
-                AvailabilityRetryMode::Explicit,
-            ),
-            AvailabilityRetryAttempt::Proceed
-        ));
+        let mut explicit_retry_claim = match manager.availability_retry_attempt(
+            instance_id,
+            ConvergenceDecision::EnsureUp,
+            &failed,
+            AvailabilityRetryMode::Explicit,
+        ) {
+            AvailabilityRetryAttempt::Claimed(claim) => claim,
+            other => panic!("expected explicit retry reset claim, got {other:?}"),
+        };
+        assert!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(&instance_id)
+                .is_none(),
+            "the explicit attempt keeps its prior retry state detached while in flight"
+        );
         manager.advance_availability_runtime_attempt_generation(instance_id);
         let second_identity = manager.availability_runtime_identity(instance_id).await;
         assert_eq!(
@@ -25144,7 +25342,7 @@ PATH = "/usr/bin:/bin"
                     attempted_runtime_identity: Some(second_identity),
                     clear_on_success: true,
                 },
-                None,
+                Some(&mut explicit_retry_claim),
             )
             .await
             .expect_err("record second readiness timeout");
@@ -25435,7 +25633,25 @@ PATH = "/usr/bin:/bin"
 
         let coordinator = manager.availability_coordinator(instance_id).await;
         let runtime_guard = coordinator.runtime.lock().await;
-        manager.converge_all_project_availability().await;
+        let dispatch = manager.converge_due_project_availability_retries().await;
+
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(&instance_id)
+                .copied(),
+            Some(AvailabilityRetryState {
+                failure_count: 1,
+                next_attempt_at: None,
+            }),
+            "an all-busy retry remains deadline-free through the maintenance pass"
+        );
+        clock.advance(Duration::from_mins(2));
+        manager
+            .converge_all_project_availability_after_retry_dispatch(dispatch)
+            .await;
 
         assert_eq!(
             manager
@@ -25448,7 +25664,7 @@ PATH = "/usr/bin:/bin"
                 failure_count: 1,
                 next_attempt_at: Some(clock.time() + AVAILABILITY_BUSY_RETRY_DELAY),
             }),
-            "a busy coordinator retains the sequence and schedules a nonzero follow-up"
+            "the busy coordinator publishes a truthful follow-up after maintenance"
         );
         assert_eq!(
             manager.availability_maintenance_delay(),
@@ -26042,6 +26258,103 @@ PATH = "/usr/bin:/bin"
             failed_status.next_transition_at,
             Some(clock.time() + Duration::from_secs(30)),
             "the failed explicit attempt projects its newly scheduled retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_action_error_restores_the_explicit_retry_reset_claim() {
+        let dir = tempdir().expect("create explicit retry restoration directory");
+        let project_path = dir.path().join("explicit-retry-restoration-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "explicit-retry-restoration",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load explicit retry restoration availability");
+        availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("seed explicit retry restoration demand");
+        availability
+            .record_convergence_error("seed explicit retry restoration failure".to_owned())
+            .await
+            .expect("seed explicit retry restoration failure");
+        manager.record_availability_retry_failure(instance_id);
+        manager.record_availability_retry_failure(instance_id);
+        let prior_recovery_identity = manager.availability_runtime_identity(instance_id).await;
+        manager.set_availability_runtime_recovery_identity(
+            instance_id,
+            Some(prior_recovery_identity.clone()),
+        );
+        let prior_retry = manager
+            .availability_retries
+            .lock()
+            .expect("retry state mutex poisoned")[&instance_id];
+        let snapshot = availability
+            .snapshot()
+            .await
+            .expect("read explicit retry restoration availability");
+
+        let claim = match manager.availability_retry_attempt(
+            instance_id,
+            ConvergenceDecision::EnsureUp,
+            &snapshot,
+            AvailabilityRetryMode::Explicit,
+        ) {
+            AvailabilityRetryAttempt::Claimed(claim) => claim,
+            other => panic!("expected explicit retry reset claim, got {other:?}"),
+        };
+        assert!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(&instance_id)
+                .is_none(),
+            "the explicit retry remains immediately runnable while its reset claim is live"
+        );
+        assert!(
+            !manager.availability_runtime_recovery_matches(instance_id, &prior_recovery_identity),
+            "the in-flight explicit attempt owns a fresh runtime-recovery boundary"
+        );
+
+        drop(claim);
+
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(&instance_id)
+                .copied(),
+            Some(prior_retry),
+            "an error before action finalization restores the prior automatic retry"
+        );
+        assert!(
+            manager.availability_runtime_recovery_matches(instance_id, &prior_recovery_identity)
+        );
+
+        manager.clear_availability_retry(instance_id);
+        let fallback_claim = match manager.availability_retry_attempt(
+            instance_id,
+            ConvergenceDecision::EnsureUp,
+            &snapshot,
+            AvailabilityRetryMode::ConfigurationChange,
+        ) {
+            AvailabilityRetryAttempt::Claimed(claim) => claim,
+            other => panic!("expected configuration retry reset claim, got {other:?}"),
+        };
+        drop(fallback_claim);
+        assert_eq!(
+            manager.availability_retry_deadline(instance_id),
+            Some(clock.time() + Duration::from_secs(30)),
+            "a post-action error recreates scheduling even when bookkeeping was absent"
         );
     }
 
