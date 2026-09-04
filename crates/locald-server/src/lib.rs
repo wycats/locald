@@ -1075,13 +1075,15 @@ async fn async_main(
                 break;
             }
             manager_reaper.reap_and_stop_orphans().await;
-            // Queued retries regain their short follow-up deadline only after
-            // the potentially blocking compatibility-owner reaper returns.
-            drop(retry_dispatch);
             if manager_reaper.is_shutting_down() {
                 break;
             }
-            manager_reaper.converge_all_project_availability().await;
+            // Keep retry claims withheld through the global sweep. This keeps
+            // later queued retries from becoming due again while an earlier
+            // ordinary lifecycle convergence is still running.
+            manager_reaper
+                .converge_all_project_availability_after_retry_dispatch(retry_dispatch)
+                .await;
         }
     });
 

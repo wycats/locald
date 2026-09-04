@@ -13144,6 +13144,40 @@ impl ProcessManager {
         Ok(())
     }
 
+    async fn reconcile_legacy_attachment_owners_for_instances(
+        &self,
+        instance_ids: &HashSet<ProjectInstanceId>,
+    ) -> Result<()> {
+        if self.is_shutting_down() || instance_ids.is_empty() {
+            return Ok(());
+        }
+        let project_paths = {
+            let attachments = self.attachments.lock().await;
+            let snapshot = attachments.snapshot();
+            snapshot
+                .instance_owners
+                .iter()
+                .filter(|(_, instance_id)| instance_ids.contains(instance_id))
+                .map(|(project_path, _)| project_path.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut failures = Vec::new();
+        for path in project_paths {
+            if let Err(error) = self.reconcile_legacy_attachment_project(path.clone()).await {
+                failures.push(format!("`{}`: {error:#}", path.display()));
+            }
+        }
+        if !failures.is_empty() {
+            anyhow::bail!(
+                "failed to reconcile {} due-retry attachment project(s): {}",
+                failures.len(),
+                failures.join("; ")
+            );
+        }
+        Ok(())
+    }
+
     pub async fn reap_and_stop_orphans(&self) {
         if let Err(error) = self.reconcile_legacy_attachment_owners().await {
             warn!("Failed to reconcile legacy project attachments: {error:#}");
@@ -13152,6 +13186,22 @@ impl ProcessManager {
 
     /// Re-evaluate every project that has entered the availability lifecycle.
     pub async fn converge_all_project_availability(&self) {
+        self.converge_all_project_availability_with_prior_dispatch(None)
+            .await;
+    }
+
+    pub(crate) async fn converge_all_project_availability_after_retry_dispatch(
+        &self,
+        prior_dispatch: AvailabilityRetryDispatch,
+    ) {
+        self.converge_all_project_availability_with_prior_dispatch(Some(prior_dispatch))
+            .await;
+    }
+
+    async fn converge_all_project_availability_with_prior_dispatch(
+        &self,
+        prior_dispatch: Option<AvailabilityRetryDispatch>,
+    ) {
         if self.is_shutting_down() {
             return;
         }
@@ -13163,8 +13213,11 @@ impl ProcessManager {
         let dispatch = self
             .converge_due_project_availability_retries_for(&instance_ids)
             .await;
-        let retry_instances_seen_this_sweep = dispatch.retry_instances_seen.clone();
-        drop(dispatch);
+        let mut retry_instances_seen_this_sweep = prior_dispatch
+            .as_ref()
+            .map(|dispatch| dispatch.retry_instances_seen.clone())
+            .unwrap_or_default();
+        retry_instances_seen_this_sweep.extend(dispatch.retry_instances_seen.iter().copied());
 
         for instance_id in instance_ids {
             if retry_instances_seen_this_sweep.contains(&instance_id) {
@@ -13178,12 +13231,18 @@ impl ProcessManager {
                 break;
             }
         }
+        // Publishing queued follow-up deadlines is the final act of the full
+        // sweep, after ordinary lifecycle work can no longer consume them in
+        // this maintenance pass.
+        drop(dispatch);
+        drop(prior_dispatch);
     }
 
     /// Dispatch only retry deadlines that have arrived, without sweeping
-    /// unrelated lifecycle leases. The maintenance loop uses this before
-    /// compatibility-owner revalidation so a slow reaper cannot hide an
-    /// advertised retry deadline.
+    /// unrelated lifecycle leases. The maintenance loop uses this before the
+    /// bulk compatibility-owner reaper so a slow unrelated owner cannot hide
+    /// an advertised retry deadline. Live owners of the due instances are
+    /// revalidated first.
     pub(crate) async fn converge_due_project_availability_retries(
         &self,
     ) -> AvailabilityRetryDispatch {
@@ -13197,8 +13256,23 @@ impl ProcessManager {
             let registry = self.registry.lock().await;
             registry.instances.keys().copied().collect::<Vec<_>>()
         };
+        let due_instance_ids = self.due_availability_retry_instance_ids(&instance_ids);
+        let due_instance_set = due_instance_ids.iter().copied().collect::<HashSet<_>>();
+        if let Err(error) = self
+            .reconcile_legacy_attachment_owners_for_instances(&due_instance_set)
+            .await
+        {
+            warn!("Failed to revalidate due-retry project attachments: {error:#}");
+            for instance_id in due_instance_ids {
+                self.defer_overdue_availability_retry(instance_id);
+            }
+            return AvailabilityRetryDispatch {
+                retry_instances_seen: due_instance_set,
+                _queued_retries: Vec::new(),
+            };
+        }
         let dispatch = self
-            .converge_due_project_availability_retries_for(&instance_ids)
+            .converge_due_project_availability_retries_for(&due_instance_ids)
             .await;
         for instance_id in dispatch.retry_instances_seen.iter().copied() {
             self.converge_background_availability_lifecycle_only(instance_id)
@@ -13210,12 +13284,33 @@ impl ProcessManager {
         dispatch
     }
 
+    fn due_availability_retry_instance_ids(
+        &self,
+        instance_ids: &[ProjectInstanceId],
+    ) -> Vec<ProjectInstanceId> {
+        let now = self.availability_now();
+        let retries = self
+            .availability_retries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        instance_ids
+            .iter()
+            .filter(|instance_id| {
+                retries
+                    .get(instance_id)
+                    .and_then(|retry| retry.next_attempt_at)
+                    .is_some_and(|deadline| deadline <= now)
+            })
+            .copied()
+            .collect()
+    }
+
     async fn converge_due_project_availability_retries_for(
         &self,
         instance_ids: &[ProjectInstanceId],
     ) -> AvailabilityRetryDispatch {
-        let now = self.availability_now();
         let mut due_retries = {
+            let now = self.availability_now();
             let retries = self
                 .availability_retries
                 .lock()
@@ -21079,7 +21174,90 @@ domains = ["retained"]
     }
 
     #[tokio::test]
-    async fn queued_retry_deadline_stays_withheld_until_dispatch_guard_drops() {
+    async fn due_retry_dispatch_revalidates_its_own_live_owner_before_convergence() {
+        let dir = tempdir().expect("create due-retry owner directory");
+        let project_path = dir.path().join("due-retry-live-owner-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "due-retry-live-owner",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        manager
+            .lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), clock.time())
+            .await
+            .expect("seed completed migration authority");
+
+        let source = AttachmentSource::CLI {
+            pid: std::process::id(),
+        };
+        let process_demand = availability_demand_for_attachment_source(&source)
+            .expect("map live process owner")
+            .expect("CLI owner has a demand");
+        let expired_at = clock
+            .time()
+            .checked_sub(locald_core::LEGACY_PROCESS_DEMAND_TTL + Duration::from_secs(1))
+            .expect("construct expired owner lease time");
+        let mut availability = AvailabilityStore::load_with_clock(
+            &availability_data_dir,
+            instance_id,
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await
+        .expect("load due-retry owner availability");
+        availability
+            .apply_batch(&AvailabilityBatch::new(expired_at).with_operation(
+                AvailabilityBatchOperation::EnsureDemand(process_demand.clone()),
+            ))
+            .await
+            .expect("seed expired live-owner demand");
+        availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("retain independent desired-up demand");
+        availability
+            .record_convergence_error("seed due retry".to_owned())
+            .await
+            .expect("seed due retry failure");
+        manager.record_availability_retry_failure(instance_id);
+        {
+            let mut attachments = manager.attachments.lock().await;
+            attachments.replace_project(
+                &project_path,
+                vec![Attachment {
+                    project_path: project_path.clone(),
+                    source,
+                    created_at: expired_at,
+                }],
+                false,
+            );
+            attachments.set_instance_owner(&project_path, instance_id);
+        }
+
+        clock.advance(Duration::from_secs(30));
+        let dispatch = manager.converge_due_project_availability_retries().await;
+
+        let renewed = availability
+            .snapshot()
+            .await
+            .expect("read due-retry owner availability");
+        assert!(
+            renewed
+                .demands()
+                .iter()
+                .find(|lease| lease.key() == &process_demand)
+                .and_then(locald_core::DemandLease::expires_at)
+                .is_some_and(|expiry| expiry > clock.time()),
+            "the due project's live owner is renewed before retry convergence can sweep it"
+        );
+        drop(dispatch);
+    }
+
+    #[tokio::test]
+    async fn queued_retry_deadline_stays_withheld_through_global_sweep() {
         let dir = tempdir().expect("create queued retry dispatch directory");
         let first_path = dir.path().join("first-retry-project");
         let second_path = dir.path().join("second-retry-project");
@@ -21143,7 +21321,9 @@ domains = ["retained"]
             "the queued retry advertises no deadline while the dispatch guard crosses reaping"
         );
 
-        drop(dispatch);
+        manager
+            .converge_all_project_availability_after_retry_dispatch(dispatch)
+            .await;
         let retries = manager
             .availability_retries
             .lock()
@@ -21152,7 +21332,7 @@ domains = ["retained"]
             retries
                 .values()
                 .all(|retry| retry.next_attempt_at.is_some()),
-            "dropping the post-reaper guard publishes every next retry deadline"
+            "completing the global sweep publishes every next retry deadline"
         );
         assert!(retries.values().any(|retry| {
             retry.next_attempt_at == Some(clock.time() + AVAILABILITY_BUSY_RETRY_DELAY)
@@ -25548,11 +25728,10 @@ PATH = "/usr/bin:/bin"
             .lock()
             .expect("retry state mutex poisoned")[&queued_retry];
         assert_eq!(queued_state.failure_count, 1);
-        assert!(
-            queued_state
-                .next_attempt_at
-                .is_some_and(|deadline| deadline <= clock.time()),
-            "the queued retry remains eligible for the next sweep instead of re-entering this one"
+        assert_eq!(
+            queued_state.next_attempt_at,
+            Some(clock.time() + AVAILABILITY_BUSY_RETRY_DELAY),
+            "the queued retry publishes its follow-up only after the slow global sweep finishes"
         );
     }
 
