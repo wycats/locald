@@ -1064,14 +1064,21 @@ async fn async_main(
             if manager_reaper.is_shutting_down() {
                 break;
             }
-            // The wake may be an advertised retry deadline. Dispatch that
-            // convergence before orphan reaping, which can wait behind a
+            // The wake may be an advertised retry deadline. Dispatch only due
+            // retries before orphan reaping, which can wait behind a
             // foreground attachment transition for an unbounded interval.
-            manager_reaper.converge_all_project_availability().await;
+            // The global lease sweep follows compatibility-owner revalidation.
+            manager_reaper
+                .converge_due_project_availability_retries()
+                .await;
             if manager_reaper.is_shutting_down() {
                 break;
             }
             manager_reaper.reap_and_stop_orphans().await;
+            if manager_reaper.is_shutting_down() {
+                break;
+            }
+            manager_reaper.converge_all_project_availability().await;
         }
     });
 

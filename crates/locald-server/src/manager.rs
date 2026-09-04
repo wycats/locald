@@ -13150,6 +13150,52 @@ impl ProcessManager {
             let registry = self.registry.lock().await;
             registry.instances.keys().copied().collect::<Vec<_>>()
         };
+        let retry_instances_seen_this_sweep = self
+            .converge_due_project_availability_retries_for(&instance_ids)
+            .await;
+
+        for instance_id in instance_ids {
+            if retry_instances_seen_this_sweep.contains(&instance_id) {
+                self.converge_background_availability_lifecycle_only(instance_id)
+                    .await;
+            } else {
+                self.converge_background_availability_instance(instance_id)
+                    .await;
+            }
+            if self.is_shutting_down() {
+                break;
+            }
+        }
+    }
+
+    /// Dispatch only retry deadlines that have arrived, without sweeping
+    /// unrelated lifecycle leases. The maintenance loop uses this before
+    /// compatibility-owner revalidation so a slow reaper cannot hide an
+    /// advertised retry deadline.
+    pub(crate) async fn converge_due_project_availability_retries(&self) {
+        if self.is_shutting_down() {
+            return;
+        }
+        let instance_ids = {
+            let registry = self.registry.lock().await;
+            registry.instances.keys().copied().collect::<Vec<_>>()
+        };
+        let retry_instances_seen = self
+            .converge_due_project_availability_retries_for(&instance_ids)
+            .await;
+        for instance_id in retry_instances_seen {
+            self.converge_background_availability_lifecycle_only(instance_id)
+                .await;
+            if self.is_shutting_down() {
+                break;
+            }
+        }
+    }
+
+    async fn converge_due_project_availability_retries_for(
+        &self,
+        instance_ids: &[ProjectInstanceId],
+    ) -> HashSet<ProjectInstanceId> {
         let now = self.availability_now();
         let mut due_retries = {
             let retries = self
@@ -13205,18 +13251,7 @@ impl ProcessManager {
             }
         }
 
-        for instance_id in instance_ids {
-            if retry_instances_seen_this_sweep.contains(&instance_id) {
-                self.converge_background_availability_lifecycle_only(instance_id)
-                    .await;
-            } else {
-                self.converge_background_availability_instance(instance_id)
-                    .await;
-            }
-            if self.is_shutting_down() {
-                break;
-            }
-        }
+        retry_instances_seen_this_sweep
     }
 
     async fn converge_background_availability_instance(
@@ -20877,6 +20912,129 @@ domains = ["retained"]
             lease
                 .expires_at()
                 .is_some_and(|expiry| expiry > SystemTime::now())
+        );
+    }
+
+    #[tokio::test]
+    async fn due_retry_dispatch_preserves_unrelated_live_owner_for_revalidation() {
+        let dir = tempdir().expect("create retry and compatibility-owner directory");
+        let retry_path = dir.path().join("due-retry-project");
+        let owner_path = dir.path().join("live-owner-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, retry_instance, availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &retry_path,
+            "due-retry",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        std::fs::create_dir_all(&owner_path).expect("create live-owner project");
+        let owner_instance = {
+            let mut registry = manager.registry.lock().await;
+            let instance_id = registry
+                .register_project(
+                    Registry::discover(
+                        std::fs::canonicalize(&owner_path).expect("canonical live-owner project"),
+                    )
+                    .await
+                    .expect("discover live-owner project"),
+                    Some("live-owner".to_owned()),
+                )
+                .expect("register live-owner project");
+            registry.save().await.expect("save live-owner catalog");
+            instance_id
+        };
+        manager
+            .lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), clock.time())
+            .await
+            .expect("seed completed migration authority");
+
+        let mut retry_availability = AvailabilityStore::load_with_clock(
+            &availability_data_dir,
+            retry_instance,
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await
+        .expect("load due-retry availability");
+        retry_availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("demand retry project");
+        retry_availability
+            .record_convergence_error("seed due retry".to_owned())
+            .await
+            .expect("seed due retry failure");
+        manager.record_availability_retry_failure(retry_instance);
+
+        let source = AttachmentSource::CLI {
+            pid: std::process::id(),
+        };
+        let demand = availability_demand_for_attachment_source(&source)
+            .expect("map live process owner")
+            .expect("CLI owner has a demand");
+        let expired_at = clock
+            .time()
+            .checked_sub(locald_core::LEGACY_PROCESS_DEMAND_TTL + Duration::from_secs(1))
+            .expect("construct expired owner lease time");
+        let mut owner_availability = AvailabilityStore::load_with_clock(
+            &availability_data_dir,
+            owner_instance,
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await
+        .expect("load live-owner availability");
+        owner_availability
+            .apply_batch(
+                &AvailabilityBatch::new(expired_at)
+                    .with_operation(AvailabilityBatchOperation::EnsureDemand(demand.clone())),
+            )
+            .await
+            .expect("seed expired live-owner demand");
+        {
+            let mut attachments = manager.attachments.lock().await;
+            attachments.replace_project(
+                &owner_path,
+                vec![Attachment {
+                    project_path: owner_path.clone(),
+                    source,
+                    created_at: expired_at,
+                }],
+                false,
+            );
+            attachments.set_instance_owner(&owner_path, owner_instance);
+        }
+
+        clock.advance(Duration::from_secs(30));
+        manager.converge_due_project_availability_retries().await;
+
+        let before_revalidation = owner_availability
+            .snapshot()
+            .await
+            .expect("read untouched live-owner demand");
+        assert!(
+            before_revalidation
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &demand),
+            "dispatching an unrelated due retry does not sweep the live owner's expired lease"
+        );
+        manager
+            .reconcile_legacy_attachment_owners()
+            .await
+            .expect("revalidate live compatibility owner");
+        let renewed = owner_availability
+            .snapshot()
+            .await
+            .expect("read renewed live-owner demand");
+        assert!(
+            renewed
+                .demands()
+                .iter()
+                .find(|lease| lease.key() == &demand)
+                .and_then(locald_core::DemandLease::expires_at)
+                .is_some_and(|expiry| expiry > clock.time()),
+            "the reaper renews the live owner before the later global lifecycle sweep"
         );
     }
 
