@@ -389,6 +389,34 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_socket_drives_the_complete_health_gated_publication_lifecycle() {
+        // This scenario exercises the real process-wide descriptor/spawn
+        // barrier. Parallel tests spawning children can legitimately make a
+        // Darwin receive fail closed with EBUSY, so run the scenario in an
+        // isolated process rather than retrying a delivered request.
+        const ISOLATED_FIXTURE: &str = "LOCALD_TEST_ISOLATED_PUBLISHER_LIFECYCLE";
+        const TEST_NAME: &str = "publisher_dispatch::tests::real_socket_drives_the_complete_health_gated_publication_lifecycle";
+        if std::env::var(ISOLATED_FIXTURE).as_deref() != Ok(TEST_NAME) {
+            let mut command = tokio::process::Command::new(
+                std::env::current_exe().expect("locate integration test executable"),
+            );
+            command
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(ISOLATED_FIXTURE, TEST_NAME)
+                .kill_on_drop(true);
+            let mut child = locald_utils::process_spawn::ProcessSpawnBarrier::global()
+                .spawn_tokio_command(&mut command)
+                .expect("spawn isolated publisher lifecycle fixture");
+            let status = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait())
+                .await
+                .expect("isolated publisher lifecycle fixture finishes")
+                .expect("wait for isolated publisher lifecycle fixture");
+            assert!(
+                status.success(),
+                "isolated publisher lifecycle fixture passes"
+            );
+            return;
+        }
+
         let directory = tempdir().expect("create publisher integration fixture");
         let project_path = directory.path().join("project");
         std::fs::create_dir(&project_path).expect("create published project");
