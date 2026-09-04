@@ -25,6 +25,8 @@ use std::ffi::OsString;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use unicode_casefold::UnicodeCaseFold;
+use unicode_normalization::UnicodeNormalization;
 
 const MAX_GENERATED_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_GENERATED_SOURCE_BYTES_U64: u64 = 1024 * 1024;
@@ -409,9 +411,14 @@ pub(crate) fn validate_declarations(config: &LocaldConfig) -> Result<()> {
                     "service `{service_name}` generated file `{name}` uses project_path, which is supported only on macOS and Linux"
                 );
                 validate_project_path(service_name, name, &generated.source, project_path)?;
-                let normalized = normalized_relative_path(project_path)
+                // Conservatively reserve canonical caseless identities, including
+                // Unicode-equivalent directory components on macOS filesystems.
+                let normalized: String = normalized_relative_path(project_path)
                     .to_string_lossy()
-                    .to_ascii_lowercase();
+                    .nfd()
+                    .case_fold()
+                    .nfd()
+                    .collect();
                 if let Some((existing_service, existing_name, existing_path)) = project_targets
                     .insert(
                         normalized,
@@ -2343,9 +2350,59 @@ async fn remove_generated_root(
             tokio::fs::remove_dir_all(root).await?;
             Ok(Vec::new())
         } else {
+            remove_unretained_generations(root, &retained).await?;
             Ok(retained)
         }
     }
+}
+
+async fn remove_unretained_generations(
+    root: &Path,
+    retained: &[StartupGeneratedFileCleanup],
+) -> Result<()> {
+    let retained_paths: BTreeSet<_> = retained
+        .iter()
+        .flat_map(|entry| {
+            // Quarantine is a sibling of its generation and remains part of
+            // that generation's recovery authority until cleanup succeeds.
+            std::iter::once(entry.generated_files.generation_dir.as_path()).chain(
+                entry
+                    .generated_files
+                    .projections
+                    .iter()
+                    .map(|projection| projection.quarantine_root.as_path()),
+            )
+        })
+        .collect();
+    let mut services = tokio::fs::read_dir(root).await?;
+    while let Some(service) = services.next_entry().await? {
+        let service_path = service.path();
+        if retained_paths
+            .iter()
+            .any(|generation| generation.parent() == Some(service_path.as_path()))
+        {
+            let mut generations = tokio::fs::read_dir(&service_path).await?;
+            while let Some(generation) = generations.next_entry().await? {
+                if !retained_paths.contains(generation.path().as_path()) {
+                    remove_stale_generated_entry(&generation).await?;
+                }
+            }
+        } else {
+            remove_stale_generated_entry(&service).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn remove_stale_generated_entry(entry: &tokio::fs::DirEntry) -> Result<()> {
+    // DirEntry::file_type does not follow symlinks: cleanup owns only the
+    // private entry, never a symlink's destination outside the generated root.
+    if entry.file_type().await?.is_dir() {
+        tokio::fs::remove_dir_all(entry.path()).await?;
+    } else {
+        tokio::fs::remove_file(entry.path()).await?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::disallowed_methods)] // This entire directory walk runs inside spawn_blocking.
@@ -4907,15 +4964,62 @@ project_path = "chat/two.locald.json"
             b"modified"
         );
         assert!(generated.generation_dir.exists());
+        let service_dir = generated
+            .generation_dir
+            .parent()
+            .expect("service directory");
+        let generated_root = service_dir.parent().expect("generated root");
+        let stale_same_service = service_dir.join("interrupted-private-generation");
+        let stale_other_service = generated_root.join("other-service/private-generation");
+        for stale in [&stale_same_service, &stale_other_service] {
+            tokio::fs::create_dir_all(stale)
+                .await
+                .expect("create stale generation");
+            tokio::fs::write(stale.join("secret.json"), b"obsolete secret")
+                .await
+                .expect("write stale private data");
+        }
+        let outside = root.path().join("outside-generated-data");
+        tokio::fs::create_dir(&outside)
+            .await
+            .expect("create unrelated directory");
+        tokio::fs::write(outside.join("keep"), b"unrelated")
+            .await
+            .expect("write unrelated file");
+        let stale_link = service_dir.join("stale-link");
+        #[cfg(unix)]
+        tokio::fs::symlink(&outside, &stale_link)
+            .await
+            .expect("create stale symlink");
         let retained = cleanup_all_instances(&data_dir)
             .await
             .expect("recovery isolates the modified target from unrelated startup cleanup");
         assert_eq!(retained.len(), 1);
+        assert!(!stale_same_service.exists());
+        assert!(
+            !stale_other_service
+                .parent()
+                .expect("other service")
+                .exists()
+        );
+        assert!(tokio::fs::symlink_metadata(&stale_link).await.is_err());
+        assert_eq!(
+            tokio::fs::read(outside.join("keep"))
+                .await
+                .expect("read unrelated file"),
+            b"unrelated"
+        );
         assert!(projection.exists());
         assert!(
             generated.generation_dir.exists(),
             "recovery retains the ownership manifest for a later exact retry"
         );
+        for projection in &generated.projections {
+            assert!(
+                projection.quarantine_root.exists(),
+                "retain exact retry quarantine authority"
+            );
+        }
         tokio::fs::write(&projection, original)
             .await
             .expect("restore owned projection");
@@ -4930,6 +5034,9 @@ project_path = "chat/two.locald.json"
             .expect("startup-retained ownership remains live-retryable");
         assert!(!projection.exists());
         assert!(!generated.generation_dir.exists());
+        for projection in &generated.projections {
+            assert!(!projection.quarantine_root.exists());
+        }
     }
 
     #[tokio::test]
@@ -5446,6 +5553,44 @@ project_path = "chat/two.locald.json"
         );
         let error = validate_declarations(&duplicate).expect_err("case-folded collision");
         assert!(error.to_string().contains("case-insensitive filesystem"));
+    }
+
+    #[test]
+    fn project_path_declarations_reject_unicode_equivalent_targets() {
+        for (first, second) in [
+            ("Étage/runtime.json", "étage/runtime.json"),
+            ("chat/café.json", "chat/cafe\u{301}.json"),
+            ("CAFÉ/runtime.json", "cafe\u{301}/runtime.json"),
+            ("chat/Σ.json", "chat/ς.json"),
+            ("chat/straße.json", "chat/STRASSE.json"),
+        ] {
+            let mut config = LocaldConfig::default();
+            config.services.insert(
+                "web".to_owned(),
+                projected_service_config("source.json", first, BTreeMap::new()),
+            );
+            config.services.insert(
+                "worker".to_owned(),
+                projected_service_config("other.json", second, BTreeMap::new()),
+            );
+            let error =
+                validate_declarations(&config).expect_err("Unicode-equivalent target collision");
+            assert!(
+                error.to_string().contains("case-insensitive filesystem"),
+                "{first} / {second}: {error}"
+            );
+        }
+
+        let mut distinct = LocaldConfig::default();
+        distinct.services.insert(
+            "web".to_owned(),
+            projected_service_config("source.json", "chat/cafe.json", BTreeMap::new()),
+        );
+        distinct.services.insert(
+            "worker".to_owned(),
+            projected_service_config("other.json", "chat/café.json", BTreeMap::new()),
+        );
+        validate_declarations(&distinct).expect("distinct Unicode names remain available");
     }
 
     #[tokio::test]
