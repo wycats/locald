@@ -7895,6 +7895,20 @@ impl ProcessManager {
                             self.path_matches_instance(&path, instance_id).await,
                             "project identity changed while preparing service `{name}` for instance {instance_id}"
                         );
+                        let generated_files = self
+                            .services
+                            .lock()
+                            .await
+                            .get(&key)
+                            .expect("service was published with its controller")
+                            .generated_files
+                            .clone();
+                        if let Some(generated_files) = generated_files {
+                            anyhow::ensure!(
+                                generated_files.projections_match().await,
+                                "generated-file projection changed during preparation before process start for service `{name}`"
+                            );
+                        }
                         Ok::<(), anyhow::Error>(())
                     }
                     .await;
@@ -7902,7 +7916,7 @@ impl ProcessManager {
                         let cleanup = self.stop_service_instance_locked(&key).await;
                         if let Err(cleanup_error) = cleanup {
                             return Err(superseded.context(format!(
-                                "failed to stop service `{name}` after availability superseded its prepared start: {cleanup_error:#}"
+                                "failed to stop service `{name}` after its prepared start was no longer authorized: {cleanup_error:#}"
                             )));
                         }
                         return Err(superseded);
@@ -40635,6 +40649,94 @@ project_path = "config/second.locald.json"
         );
         assert!(!first_target.exists());
         assert!(!project_path.join("config/second.locald.json").exists());
+    }
+
+    #[tokio::test]
+    async fn preparation_boundary_rejects_missing_and_foreign_projections_before_start() {
+        for replace_with_foreign in [false, true] {
+            let dir = tempdir().expect("create preparation projection directory");
+            let project_path = dir.path().join("project");
+            let (mut manager, instance_id, availability_data_dir) =
+                availability_manager(dir.path(), &project_path, "projection-prepare").await;
+            std::fs::create_dir(project_path.join("config")).expect("create config directory");
+            std::fs::write(project_path.join("source.json"), r#"{"value":1}"#)
+                .expect("write source");
+            std::fs::write(
+                project_path.join("locald.toml"),
+                r#"
+[project]
+name = "projection-prepare"
+domain = "projection-prepare.localhost"
+[services.web]
+type = "worker"
+command = "unused-by-test-factory"
+[services.web.env]
+PATH = "/usr/bin:/bin"
+[services.web.generated.runtime]
+source = "source.json"
+project_path = "config/runtime.locald.json"
+"#,
+            )
+            .expect("write projection preparation config");
+            let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+                .await
+                .expect("load availability");
+            availability
+                .set_always_on(true)
+                .await
+                .expect("seed desired-up policy");
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let start_count = Arc::new(AtomicUsize::new(0));
+            let stop_count = Arc::new(AtomicUsize::new(0));
+            manager.factories.insert(
+                0,
+                Arc::new(BlockingPrepareFactory {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                    start_count: start_count.clone(),
+                    stop_count: stop_count.clone(),
+                }),
+            );
+            let convergence = tokio::spawn({
+                let manager = manager.clone();
+                async move {
+                    manager
+                        .converge_managed_instance(instance_id, None, false, true)
+                        .await
+                }
+            });
+            tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, entered.notified())
+                .await
+                .expect("service enters preparation after initial projection validation");
+            let target = project_path.join("config/runtime.locald.json");
+            std::fs::remove_file(&target).expect("remove projection during preparation");
+            if replace_with_foreign {
+                std::fs::write(&target, b"foreign data").expect("replace with foreign projection");
+            }
+            release.notify_one();
+            let error = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, convergence)
+                .await
+                .expect("prepared convergence finishes")
+                .expect("join convergence")
+                .expect_err("changed projection prevents process start");
+            assert!(
+                format!("{error:#}").contains("changed during preparation before process start"),
+                "{error:#}"
+            );
+            assert_eq!(start_count.load(Ordering::SeqCst), 0);
+            assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+            if replace_with_foreign {
+                assert_eq!(
+                    std::fs::read(&target).expect("foreign replacement retained"),
+                    b"foreign data"
+                );
+                std::fs::remove_file(&target).expect("remove test-owned foreign replacement");
+                manager.retry_deferred_generated_file_cleanups().await;
+            } else {
+                assert!(!target.exists());
+            }
+        }
     }
 
     #[tokio::test]
