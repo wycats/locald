@@ -15718,6 +15718,9 @@ mod tests {
     use tokio::sync::Mutex;
     use tower::ServiceExt;
 
+    // Fixture admission can perform filesystem work on the blocking pool while
+    // other tests run. This is a deadlock guard, not a lifecycle timing claim;
+    // the explicit notifications/locks establish each tested interleaving.
     const TEST_STARTUP_BOUNDARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     const TEST_AVAILABILITY_START_SECONDS: u64 = 1_000_000;
 
@@ -29782,12 +29785,9 @@ PATH = "/usr/bin:/bin"
             let project_path = project_path.clone();
             async move { manager.start(project_path, None, false).await }
         });
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            prepare_entered.notified(),
-        )
-        .await
-        .expect("startup reaches the prepared pre-spawn boundary");
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, prepare_entered.notified())
+            .await
+            .expect("startup reaches the prepared pre-spawn boundary");
 
         availability
             .release_demand(&demand)
@@ -31352,7 +31352,7 @@ PATH = "/usr/bin:/bin"
             let project_path = project_path.clone();
             async move { manager.start(project_path, None, false).await }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
             loop {
                 if transition_lock.try_lock().is_err() {
                     break;
