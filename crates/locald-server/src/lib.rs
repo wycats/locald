@@ -1068,13 +1068,16 @@ async fn async_main(
             // retries before orphan reaping, which can wait behind a
             // foreground attachment transition for an unbounded interval.
             // The global lease sweep follows compatibility-owner revalidation.
-            manager_reaper
+            let retry_dispatch = manager_reaper
                 .converge_due_project_availability_retries()
                 .await;
             if manager_reaper.is_shutting_down() {
                 break;
             }
             manager_reaper.reap_and_stop_orphans().await;
+            // Queued retries regain their short follow-up deadline only after
+            // the potentially blocking compatibility-owner reaper returns.
+            drop(retry_dispatch);
             if manager_reaper.is_shutting_down() {
                 break;
             }
