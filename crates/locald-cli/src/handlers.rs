@@ -318,11 +318,33 @@ fn print_availability(availability: &ProjectAvailabilityStatus) {
         println!("  - {}", reason.message);
     }
     if let Some(next_transition_at) = availability.next_transition_at {
-        println!(
-            "Next transition: {}",
-            format_status_time(next_transition_at)
-        );
+        let label = availability_deadline_label(availability);
+        println!("{label}: {}", format_status_time(next_transition_at));
     }
+}
+
+fn availability_deadline_label(availability: &ProjectAvailabilityStatus) -> &'static str {
+    if availability.desired
+        && availability.last_error.is_some()
+        && !availability_deadline_is_final_demand_expiry(availability)
+    {
+        "Next retry"
+    } else {
+        "Next transition"
+    }
+}
+
+fn availability_deadline_is_final_demand_expiry(availability: &ProjectAvailabilityStatus) -> bool {
+    if availability.always_on || availability.paused || availability.demands.is_empty() {
+        return false;
+    }
+    availability
+        .demands
+        .iter()
+        .map(|demand| demand.expires_at)
+        .collect::<Option<Vec<_>>>()
+        .and_then(|expiries| expiries.into_iter().max())
+        == availability.next_transition_at
 }
 
 fn is_semantic_status_url(url: &str) -> bool {
@@ -2495,6 +2517,53 @@ fn invoking_user_uid(sudo_uid: Option<&str>) -> CliResult<u32> {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    fn availability_status(desired: bool, last_error: Option<&str>) -> ProjectAvailabilityStatus {
+        ProjectAvailabilityStatus {
+            desired,
+            state: if last_error.is_some() {
+                locald_core::ProjectLifecycleState::Failed
+            } else {
+                locald_core::ProjectLifecycleState::Ready
+            },
+            always_on: false,
+            paused: false,
+            reasons: Vec::new(),
+            demands: Vec::new(),
+            next_transition_at: Some(std::time::UNIX_EPOCH),
+            last_error: last_error.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn availability_deadline_label_distinguishes_retries_from_transitions() {
+        assert_eq!(
+            availability_deadline_label(&availability_status(true, Some("failed"))),
+            "Next retry"
+        );
+        assert_eq!(
+            availability_deadline_label(&availability_status(false, Some("failed"))),
+            "Next transition"
+        );
+        assert_eq!(
+            availability_deadline_label(&availability_status(true, None)),
+            "Next transition"
+        );
+
+        let mut expiry_first = availability_status(true, Some("failed"));
+        expiry_first.next_transition_at = Some(std::time::UNIX_EPOCH);
+        expiry_first
+            .demands
+            .push(locald_core::AvailabilityDemandStatus {
+                kind: locald_core::DemandKind::VsCodeWindow,
+                safe_label: "VS Code window".to_owned(),
+                expires_at: Some(std::time::UNIX_EPOCH),
+            });
+        assert_eq!(
+            availability_deadline_label(&expiry_first),
+            "Next transition"
+        );
+    }
 
     #[test]
     fn semantic_status_urls_exclude_direct_loopback_service_ports() {

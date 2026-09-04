@@ -4,6 +4,7 @@ import {
 	availabilityMessage,
 	demandSummary,
 	formatTransition,
+	transitionLabel,
 	projectCanPause,
 	projectCanResume
 } from './availability';
@@ -77,5 +78,30 @@ describe('project availability presentation', () => {
 		expect(formatTransition({ secs_since_epoch: 1_000, nanos_since_epoch: 0 }, 940_400)).toBe(
 			'in 60s'
 		);
+	});
+
+	it('labels desired-up convergence failures as retries across lifecycle states', () => {
+		expect(transitionLabel(status({ state: 'failed', last_error: 'failed' }))).toBe('Next retry');
+		expect(transitionLabel(status({ state: 'missing', last_error: 'missing' }))).toBe('Next retry');
+		expect(
+			transitionLabel(status({ state: 'cooling_down', desired: false, last_error: 'stopping' }))
+		).toBe('Next transition');
+		expect(transitionLabel(status({ state: 'cooling_down' }))).toBe('Next transition');
+		expect(
+			transitionLabel(
+				status({
+					state: 'failed',
+					last_error: 'failed',
+					demands: [
+						{
+							kind: 'vs_code_window',
+							safe_label: 'VS Code window',
+							expires_at: { secs_since_epoch: 1_000, nanos_since_epoch: 0 }
+						}
+					],
+					next_transition_at: { secs_since_epoch: 1_000, nanos_since_epoch: 0 }
+				})
+			)
+		).toBe('Next transition');
 	});
 });

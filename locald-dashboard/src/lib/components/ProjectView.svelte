@@ -19,7 +19,8 @@
 		demandSummary,
 		formatTransition,
 		projectCanPause,
-		projectCanResume
+		projectCanResume,
+		transitionLabel
 	} from '$lib/availability';
 	import type { ProjectListEntry } from '$lib/api';
 	import { serviceIdentity, type ServiceStatus } from '$lib/types';
@@ -224,7 +225,7 @@
 							<span>Demand: {liveDemands}</span>
 						{/if}
 						{#if nextTransition}
-							<span>Next transition {nextTransition}</span>
+							<span>{transitionLabel(project.availability)} {nextTransition}</span>
 						{/if}
 					</div>
 				</div>
