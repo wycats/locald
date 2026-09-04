@@ -1743,7 +1743,7 @@ mod tests {
     }
 
     #[test]
-    fn unix_transport_rejects_response_descriptors_and_trailing_bytes() {
+    fn unix_transport_rejects_response_descriptors() {
         let (_directory, socket, listener) = publisher_listener();
         let response = release_response();
         let file = File::open("/dev/null").expect("open descriptor fixture");
@@ -1779,7 +1779,10 @@ mod tests {
         assert_eq!(failure.certainty, DeliveryCertainty::OutcomeUnknown);
         assert_eq!(failure.error.kind, BackendErrorKind::Protocol);
         server.join().expect("publisher server");
+    }
 
+    #[test]
+    fn unix_transport_rejects_trailing_bytes() {
         let (_directory, socket, listener) = publisher_listener();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept publisher connection");
