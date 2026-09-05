@@ -43,6 +43,7 @@ struct SourceFingerprint([u8; 32]);
 #[derive(Debug)]
 struct LoadedSource {
     bytes: Vec<u8>,
+    identity: ProjectionFileIdentity,
     fingerprint: SourceFingerprint,
     format: GeneratedFileFormat,
 }
@@ -84,7 +85,7 @@ struct ProjectionFilesystemIdentity {
     mount_id: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct ProjectionFileIdentity {
     #[cfg(unix)]
     device: u64,
@@ -453,6 +454,13 @@ pub(crate) async fn prepare(
                 key.name()
             )
         })?;
+        anyhow::ensure!(
+            !allowed_existing.is_some_and(|existing| existing
+                .projections
+                .iter()
+                .any(|projection| projection.identity == source.identity)),
+            "generated-file `{name}` source resolves to a currently owned projection; use an independent source file so stopping the service preserves its input"
+        );
         let value = parse_source(&source).with_context(|| {
             format!(
                 "failed to parse generated file `{name}` source `{}`",
@@ -467,7 +475,7 @@ pub(crate) async fn prepare(
         })?;
         let projection = match &config.project_path {
             Some(project_path) => Some(
-                prepare_projection_target(project_root, project_path, allowed_existing)
+                prepare_projection_target(project_root, project_path, allowed_existing, &source.identity)
                     .await
                     .with_context(|| {
                         format!(
@@ -599,7 +607,12 @@ async fn ensure_prepared_projection_filesystems(
     .await
     .context("generated-file private filesystem identity task failed")??;
     validate_prepared_projection_filesystems(&private_filesystem_identity, prepared)?;
-    verify_prepared_projection_writes(prepared).await
+    // Probe quarantine can retain an entry supplied by a concurrent project
+    // writer. Keep it outside generation garbage collection, including restart
+    // cleanup of manifest-less staging directories.
+    let probe_root = data_dir.join("projection-write-probes");
+    create_private_directory(&probe_root, true).await?;
+    verify_prepared_projection_writes(prepared, &probe_root).await
 }
 
 fn validate_prepared_projection_filesystems(
@@ -627,13 +640,19 @@ fn ensure_projection_same_mount(
     Ok(())
 }
 
-async fn verify_prepared_projection_writes(prepared: &PreparedGeneratedFileSet) -> Result<()> {
+async fn verify_prepared_projection_writes(
+    prepared: &PreparedGeneratedFileSet,
+    probe_root: &Path,
+) -> Result<()> {
     let projections = prepared
         .sources
         .values()
         .filter_map(|source| source.projection.clone())
         .collect::<Vec<_>>();
+    let private_path = probe_root.join(format!(".write-probe-{}", uuid::Uuid::new_v4()));
+    create_private_directory(&private_path, false).await?;
     tokio::task::spawn_blocking(move || {
+        let result = (|| {
         for projection in projections {
             let parent = open_exact_project_parent(
                 &projection.canonical_project_root,
@@ -641,7 +660,11 @@ async fn verify_prepared_projection_writes(prepared: &PreparedGeneratedFileSet) 
                 &projection.parent_relative_path,
                 &projection.parent_identity,
             )?;
-            verify_projection_parent_write(&parent).with_context(|| {
+            verify_projection_parent_write(
+                &parent,
+                &private_path,
+                &projection.canonical_project_root.join(&projection.parent_relative_path),
+            ).with_context(|| {
                 format!(
                     "generated-file project_path parent `{}` cannot create projection entries",
                     projection
@@ -652,28 +675,30 @@ async fn verify_prepared_projection_writes(prepared: &PreparedGeneratedFileSet) 
             })?;
         }
         Ok::<_, anyhow::Error>(())
+        })();
+        // A failed restoration may retain a foreign entry in private quarantine.
+        // Remove only an empty directory; its contents remain available for recovery.
+        match std::fs::remove_dir(&private_path) {
+            Ok(()) => result,
+            Err(error) => result.and_then(|()| Err(error.into())).with_context(|| format!(
+                "projection write-probe quarantine is retained at `{}`; inspect the reported entry before removing it",
+                private_path.display()
+            )),
+        }
     })
     .await
     .context("generated-file project_path write preflight task failed")?
 }
 
-struct ProjectionWriteProbeCleanup<'a> {
-    parent: &'a Dir,
-    name: &'a Path,
-    removed: bool,
-}
-
-impl Drop for ProjectionWriteProbeCleanup<'_> {
-    fn drop(&mut self) {
-        if !self.removed {
-            let _ = self.parent.remove_file(self.name);
-        }
-    }
-}
-
-fn verify_projection_parent_write(parent: &Dir) -> Result<()> {
+fn verify_projection_parent_write(
+    parent: &Dir,
+    private_path: &Path,
+    parent_path: &Path,
+) -> Result<()> {
     verify_projection_parent_write_with_operations(
         parent,
+        private_path,
+        parent_path,
         set_projection_provenance,
         rename_projection_noreplace,
     )
@@ -681,13 +706,20 @@ fn verify_projection_parent_write(parent: &Dir) -> Result<()> {
 
 fn verify_projection_parent_write_with_operations<F, G>(
     parent: &Dir,
+    private_path: &Path,
+    parent_path: &Path,
     bind_provenance: F,
-    rename: G,
+    mut rename: G,
 ) -> Result<()>
 where
     F: FnOnce(&cap_std::fs::File, &str) -> Result<()>,
-    G: FnOnce(&Dir, &Path, &Dir, &Path) -> std::io::Result<()>,
+    G: FnMut(&Dir, &Path, &Dir, &Path) -> std::io::Result<()>,
 {
+    let private_root = Dir::open_ambient_dir(private_path, ambient_authority())?;
+    ensure_projection_same_mount(
+        &projection_filesystem_identity(&private_root)?,
+        &projection_filesystem_identity(parent)?,
+    )?;
     let name = PathBuf::from(format!(
         ".locald-projection-write-probe-{}",
         uuid::Uuid::new_v4()
@@ -698,37 +730,70 @@ where
     options
         .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    let probe = parent.open_with(&name, &options)?;
-    let mut cleanup = ProjectionWriteProbeCleanup {
-        parent,
-        name: &name,
-        removed: false,
-    };
-
-    // Exercise the inode provenance and atomic cleanup primitives before a
-    // healthy service is stopped. File creation alone does not establish
-    // support for either operation on this project filesystem.
+    let probe = private_root.open_with(&name, &options)?;
+    let identity = projection_file_identity(&probe.metadata()?);
     let projection_id = uuid::Uuid::new_v4().to_string();
-    bind_provenance(&probe, &projection_id)?;
-    anyhow::ensure!(
-        projection_provenance_matches(&probe, &projection_id)?,
-        "generated-file project_path provenance probe did not round-trip"
-    );
-    let quarantine_name = PathBuf::from(format!(
-        ".locald-projection-quarantine-probe-{}",
-        uuid::Uuid::new_v4()
-    ));
-    rename(parent, &name, parent, &quarantine_name)
-        .context("generated-file project_path requires atomic no-replace quarantine support")?;
-    cleanup.removed = true;
-    let mut quarantine_cleanup = ProjectionWriteProbeCleanup {
-        parent,
-        name: &quarantine_name,
-        removed: false,
-    };
-    parent.remove_file(&quarantine_name)?;
-    quarantine_cleanup.removed = true;
-    Ok(())
+    let mut exposed = false;
+    let result = (|| {
+        // Bind the inode privately. Unsupported provenance or no-replace rename
+        // fails before any entry is exposed in the user's project namespace.
+        bind_provenance(&probe, &projection_id)?;
+        anyhow::ensure!(
+            projection_provenance_matches(&probe, &projection_id)?,
+            "generated-file project_path provenance probe did not round-trip"
+        );
+        rename(&private_root, &name, parent, &name)
+            .context("generated-file project_path requires atomic no-replace quarantine support")?;
+        exposed = true;
+        let quarantine_name = PathBuf::from("quarantined-probe");
+        rename(parent, &name, &private_root, &quarantine_name).with_context(|| format!(
+        "projection write probe remains at `{}` because returning it to private quarantine failed; preserve and inspect this entry before retrying",
+        parent_path.join(&name).display()
+    ))?;
+        let parent_identity = projection_file_identity(&parent.dir_metadata()?);
+        let ownership = ProjectionOwnership {
+            name: "write-probe".to_owned(),
+            projection_id,
+            canonical_project_root: parent_path.to_path_buf(),
+            project_root_identity: parent_identity.clone(),
+            parent_relative_path: PathBuf::new(),
+            parent_identity,
+            file_name: name.clone(),
+            quarantine_root: private_path.to_path_buf(),
+            quarantine_root_identity: projection_file_identity(&private_root.dir_metadata()?),
+            relative_path: name.clone(),
+            target_quarantine_path: quarantine_name.clone(),
+            digest: Sha256::digest([]).into(),
+            size: 0,
+            identity: identity.clone(),
+        };
+        // Keep the original descriptor alive throughout quarantine validation,
+        // excluding inode reuse. The shared cleanup verifies inode, provenance,
+        // and empty contents, and restores foreign or modified entries safely.
+        cleanup_quarantined_projection_path_with_rename(
+            parent,
+            &private_root,
+            &ownership,
+            &name,
+            &quarantine_name,
+            &mut rename,
+        )
+    })();
+    if !exposed {
+        let metadata = private_root.symlink_metadata(&name)?;
+        anyhow::ensure!(
+            metadata.is_file()
+                && projection_file_identity(&metadata) == identity
+                && metadata.len() == 0,
+            "private projection write probe changed before exposure; retaining the entry at `{}` for inspection",
+            private_path.join(&name).display()
+        );
+        private_root
+            .remove_file(&name)
+            .context("failed to remove private write probe")?;
+    }
+    drop(probe);
+    result
 }
 
 async fn publish_prepared(
@@ -1946,6 +2011,27 @@ fn cleanup_quarantined_projection_path(
     original_path: &Path,
     quarantine_path: &Path,
 ) -> Result<()> {
+    cleanup_quarantined_projection_path_with_rename(
+        project_root,
+        quarantine_root,
+        projection,
+        original_path,
+        quarantine_path,
+        rename_projection_noreplace,
+    )
+}
+
+fn cleanup_quarantined_projection_path_with_rename<F>(
+    project_root: &Dir,
+    quarantine_root: &Dir,
+    projection: &ProjectionOwnership,
+    original_path: &Path,
+    quarantine_path: &Path,
+    mut rename: F,
+) -> Result<()>
+where
+    F: FnMut(&Dir, &Path, &Dir, &Path) -> std::io::Result<()>,
+{
     let metadata = match quarantine_root.symlink_metadata(quarantine_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2035,7 +2121,7 @@ fn cleanup_quarantined_projection_path(
     })();
 
     if let Err(error) = validation {
-        match rename_projection_noreplace(
+        match rename(
             quarantine_root,
             quarantine_path,
             project_root,
@@ -2045,7 +2131,7 @@ fn cleanup_quarantined_projection_path(
             Err(restore_error) if restore_error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let recovered_path =
                     PathBuf::from(format!(".locald-recovered-{}", uuid::Uuid::new_v4()));
-                match rename_projection_noreplace(
+                match rename(
                     quarantine_root,
                     quarantine_path,
                     project_root,
@@ -2660,6 +2746,7 @@ async fn load_source(project_root: &Path, config: &GeneratedFileConfig) -> Resul
     let fingerprint = SourceFingerprint(Sha256::digest(&bytes).into());
     Ok(LoadedSource {
         bytes,
+        identity: projection_file_identity_from_std(&metadata),
         fingerprint,
         format,
     })
@@ -2669,6 +2756,7 @@ async fn prepare_projection_target(
     project_root: &Path,
     configured: &str,
     allowed_existing: Option<&GeneratedFileSet>,
+    source_identity: &ProjectionFileIdentity,
 ) -> Result<PreparedProjection> {
     anyhow::ensure!(
         project_path_supported(),
@@ -2748,6 +2836,12 @@ async fn prepare_projection_target(
         })
         .await
         .context("generated-file project_path parent capability task failed")??;
+    anyhow::ensure!(
+        !target_metadata
+            .as_ref()
+            .is_some_and(|metadata| projection_file_identity(metadata) == *source_identity),
+        "generated-file source resolves to its project_path target; use an independent source file"
+    );
     let target_is_owned = match (allowed_existing, target_metadata.as_ref()) {
         (Some(owned), Some(metadata)) => {
             owned
@@ -3459,6 +3553,49 @@ mod tests {
         );
         assert!(output.ends_with('\n'));
         generated.cleanup().await.expect("clean generation");
+    }
+
+    #[tokio::test]
+    async fn preparation_rejects_a_source_symlink_to_its_owned_projection() {
+        let root = tempdir().expect("create source-alias root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"value":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "runtime.locald.json", BTreeMap::new());
+        let generated = materialize(
+            &root.path().join("data"),
+            root.path(),
+            &key(),
+            &config,
+            &bindings(),
+        )
+        .await
+        .expect("materialize projection")
+        .expect("generated set");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("runtime.locald.json", root.path().join("alias.json"))
+            .expect("alias owned projection");
+        #[cfg(not(unix))]
+        std::fs::hard_link(
+            root.path().join("runtime.locald.json"),
+            root.path().join("alias.json"),
+        )
+        .expect("alias owned projection");
+        for target in ["runtime.locald.json", "replacement.locald.json"] {
+            let aliased = projected_service_config("alias.json", target, BTreeMap::new());
+            let error = prepare(root.path(), &key(), &aliased, Some(&generated))
+                .await
+                .expect_err("projection output cannot become its own or a successor's source");
+            assert!(
+                format!("{error:#}").contains("source resolves to a currently owned projection")
+            );
+        }
+        assert!(
+            generated.projections_match().await,
+            "rejected preparation preserves active output"
+        );
+        generated.cleanup().await.expect("clean fixture projection");
     }
 
     #[tokio::test]
@@ -4380,18 +4517,29 @@ mod tests {
     #[test]
     fn projection_preflight_exercises_provenance_and_atomic_quarantine() {
         let root = tempdir().expect("create projection capability root");
+        let private = tempdir().expect("create private probe root");
         let parent = Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open parent");
-        verify_projection_parent_write(&parent).expect("supported filesystem passes preflight");
+        verify_projection_parent_write(&parent, private.path(), root.path())
+            .expect("supported filesystem passes preflight");
         assert_eq!(parent.entries().expect("inspect probe cleanup").count(), 0);
+        assert_eq!(
+            std::fs::read_dir(private.path())
+                .expect("inspect private cleanup")
+                .count(),
+            0
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn projection_preflight_rejects_unsupported_provenance_and_cleans_probe() {
         let root = tempdir().expect("create unsupported provenance root");
+        let private = tempdir().expect("create private probe root");
         let parent = Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open parent");
         let error = verify_projection_parent_write_with_operations(
             &parent,
+            private.path(),
+            root.path(),
             |_, _| Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP).into()),
             |_, _, _, _| unreachable!("quarantine follows successful provenance verification"),
         )
@@ -4409,9 +4557,12 @@ mod tests {
     #[test]
     fn projection_preflight_verifies_provenance_round_trip() {
         let root = tempdir().expect("create mismatched provenance root");
+        let private = tempdir().expect("create private probe root");
         let parent = Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open parent");
         let error = verify_projection_parent_write_with_operations(
             &parent,
+            private.path(),
+            root.path(),
             |file, _| set_projection_provenance(file, "different-projection"),
             |_, _, _, _| unreachable!("quarantine follows successful provenance verification"),
         )
@@ -4429,10 +4580,13 @@ mod tests {
     fn projection_preflight_rejects_unavailable_atomic_quarantine_and_cleans_probe() {
         for errno in [libc::ENOSYS, libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
             let root = tempdir().expect("create unsupported quarantine root");
+            let private = tempdir().expect("create private probe root");
             let parent =
                 Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open parent");
             let error = verify_projection_parent_write_with_operations(
                 &parent,
+                private.path(),
+                root.path(),
                 set_projection_provenance,
                 |_, _, _, _| Err(std::io::Error::from_raw_os_error(errno)),
             )
@@ -4450,6 +4604,193 @@ mod tests {
             );
             assert_eq!(parent.entries().expect("inspect probe cleanup").count(), 0);
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn projection_preflight_preserves_replaced_and_modified_entries_at_every_return_boundary() {
+        for scenario in [
+            "replaced",
+            "modified",
+            "collision",
+            "return-failure",
+            "restore-failure",
+            "recovery-failure",
+        ] {
+            let root = tempdir().expect("create public probe fixture");
+            let private = tempdir().expect("create private probe fixture");
+            let parent =
+                Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open parent");
+            let mut calls = 0;
+            let mut public_name = PathBuf::new();
+            let error = verify_projection_parent_write_with_operations(
+                &parent,
+                private.path(),
+                root.path(),
+                set_projection_provenance,
+                |from_root, from, to_root, to| {
+                    let step = calls;
+                    calls += 1;
+                    if (step == 1 && scenario == "return-failure")
+                        || (step == 2 && scenario == "restore-failure")
+                        || (step == 3 && scenario == "recovery-failure")
+                    {
+                        return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+                    }
+                    rename_projection_noreplace(from_root, from, to_root, to)?;
+                    if step == 0 {
+                        public_name = to.to_path_buf();
+                        if scenario != "modified" {
+                            to_root.remove_file(to)?;
+                        }
+                        to_root.write(to, b"user contents")?;
+                    }
+                    if step == 1 && matches!(scenario, "collision" | "recovery-failure") {
+                        from_root.write(from, b"new occupant")?;
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("changed probes remain user-owned entries");
+            let public = root.path().join(&public_name);
+            match scenario {
+                "restore-failure" | "recovery-failure" => {
+                    assert_eq!(
+                        std::fs::read(private.path().join("quarantined-probe"))
+                            .expect("retained private contents"),
+                        b"user contents"
+                    );
+                    assert!(format!("{error:#}").contains(&private.path().display().to_string()));
+                    if scenario == "recovery-failure" {
+                        assert_eq!(
+                            std::fs::read(public).expect("public occupant preserved"),
+                            b"new occupant"
+                        );
+                    } else {
+                        assert!(!public.exists());
+                    }
+                }
+                "collision" => {
+                    assert_eq!(
+                        std::fs::read(public).expect("public occupant preserved"),
+                        b"new occupant"
+                    );
+                    let recovered = std::fs::read_dir(root.path())
+                        .expect("read recovered entries")
+                        .map(|entry| entry.expect("entry").path())
+                        .find(|path| {
+                            path.file_name().is_some_and(|name| {
+                                name.to_string_lossy().starts_with(".locald-recovered-")
+                            })
+                        })
+                        .expect("foreign entry recovered beside occupied public path");
+                    assert_eq!(
+                        std::fs::read(recovered).expect("read recovered content"),
+                        b"user contents"
+                    );
+                }
+                _ => assert_eq!(
+                    std::fs::read(public).expect("user entry returned or retained"),
+                    b"user contents"
+                ),
+            }
+            if !matches!(scenario, "restore-failure" | "recovery-failure") {
+                assert_eq!(
+                    std::fs::read_dir(private.path())
+                        .expect("read empty quarantine")
+                        .count(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn projection_preflight_preserves_a_private_name_replaced_before_exposure() {
+        let root = tempdir().expect("create public probe fixture");
+        let private = tempdir().expect("create private probe fixture");
+        let parent = Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open parent");
+        let error = verify_projection_parent_write_with_operations(
+            &parent,
+            private.path(),
+            root.path(),
+            |_, _| {
+                let entry = std::fs::read_dir(private.path())?
+                    .next()
+                    .expect("private probe")?
+                    .path();
+                std::fs::remove_file(&entry)?;
+                std::fs::write(&entry, b"private replacement")?;
+                anyhow::bail!("injected provenance failure")
+            },
+            |_, _, _, _| unreachable!("failed binding never exposes a public entry"),
+        )
+        .expect_err("private replacement retained");
+        assert!(format!("{error:#}").contains("private projection write probe changed"));
+        let entry = std::fs::read_dir(private.path())
+            .expect("private entries")
+            .next()
+            .expect("retained entry")
+            .expect("entry")
+            .path();
+        assert_eq!(
+            std::fs::read(entry).expect("read retained entry"),
+            b"private replacement"
+        );
+        assert_eq!(parent.entries().expect("public entries").count(), 0);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn projection_preflight_retained_foreign_quarantine_survives_startup_generation_cleanup()
+    {
+        let root = tempdir().expect("create recovery fixture");
+        let data = root.path().join("data");
+        let private = data.join("projection-write-probes/retained-attempt");
+        create_private_directory(&private, true)
+            .await
+            .expect("private quarantine");
+        let stale = service_root_path(&data, &key()).join("stale-generation");
+        create_private_directory(&stale, true)
+            .await
+            .expect("stale generated directory");
+        tokio::fs::write(stale.join("stale.json"), b"{}")
+            .await
+            .expect("stale generated output");
+        let parent = Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open parent");
+        let mut calls = 0;
+        verify_projection_parent_write_with_operations(
+            &parent,
+            &private,
+            root.path(),
+            set_projection_provenance,
+            |from_root, from, to_root, to| {
+                let step = calls;
+                calls += 1;
+                if step == 2 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+                }
+                rename_projection_noreplace(from_root, from, to_root, to)?;
+                if step == 0 {
+                    to_root.remove_file(to)?;
+                    to_root.write(to, b"retained user data")?;
+                }
+                Ok(())
+            },
+        )
+        .expect_err("failed restoration keeps foreign entry quarantined");
+        cleanup_all_instances(&data).await.expect("startup cleanup");
+        assert!(
+            !stale.exists(),
+            "startup cleanup exercised stale generation removal"
+        );
+        assert_eq!(
+            tokio::fs::read(private.join("quarantined-probe"))
+                .await
+                .expect("foreign quarantine survived"),
+            b"retained user data"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -5978,6 +6319,7 @@ source = "runtime.json"
         ] {
             let loaded = LoadedSource {
                 bytes: source.as_bytes().to_vec(),
+                identity: ProjectionFileIdentity::default(),
                 fingerprint: SourceFingerprint([0; 32]),
                 format: GeneratedFileFormat::Jsonc,
             };
@@ -5990,6 +6332,7 @@ source = "runtime.json"
         for source in ["null", "/* comment */ null // trailing comment"] {
             let loaded = LoadedSource {
                 bytes: source.as_bytes().to_vec(),
+                identity: ProjectionFileIdentity::default(),
                 fingerprint: SourceFingerprint([0; 32]),
                 format: GeneratedFileFormat::Jsonc,
             };
@@ -6002,6 +6345,7 @@ source = "runtime.json"
         for source in ["", " \n\t", "// comment only"] {
             let loaded = LoadedSource {
                 bytes: source.as_bytes().to_vec(),
+                identity: ProjectionFileIdentity::default(),
                 fingerprint: SourceFingerprint([0; 32]),
                 format: GeneratedFileFormat::Jsonc,
             };

@@ -499,6 +499,20 @@ fn collect_invalidated_generated_watch_paths(
     invalidated
 }
 
+fn generated_projection_watch_paths(project_path: &Path, projection: &str) -> HashSet<PathBuf> {
+    let configured = project_path.join(projection);
+    let mut paths = HashSet::from([configured.clone()]);
+    // Resolve the existing parent even before the projection is materialized.
+    // Native events use that parent's canonical spelling; retain the lexical
+    // path as well so ancestor replacement remains observable.
+    if let Ok(canonical) = locald_core::normalize_project_locator(&configured) {
+        if canonical.starts_with(project_path) {
+            paths.insert(canonical);
+        }
+    }
+    paths
+}
+
 fn generated_source_watch_candidates(project_path: &Path, source_path: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let Some(mut directory) = source_path.parent() else {
@@ -6583,7 +6597,7 @@ impl ProcessManager {
                 .values()
                 .flat_map(|service| service.generated().values())
                 .filter_map(|generated| generated.project_path.as_ref())
-                .map(|path| project_path.join(path))
+                .flat_map(|path| generated_projection_watch_paths(&project_path, path))
                 .collect()
         } else {
             HashSet::new()
@@ -6601,7 +6615,8 @@ impl ProcessManager {
                     }
                 }
                 if let Some(projection) = &generated.project_path {
-                    desired_projections.insert(project_path.join(projection));
+                    desired_projections
+                        .extend(generated_projection_watch_paths(&project_path, projection));
                 }
             }
         }
@@ -39806,6 +39821,70 @@ COMBINED = "${services.web.port}:${services.web.listeners.hmr.port}"
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn generated_projection_watch_paths_normalize_missing_suffixes_within_project() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().expect("create projection watch path fixture");
+        let project_path = root.path().join("project");
+        std::fs::create_dir_all(project_path.join("real"))
+            .expect("create existing projection ancestor");
+        let project_path = std::fs::canonicalize(project_path).expect("canonical project");
+        symlink("real", project_path.join("alias")).expect("link in-project ancestor");
+        let paths = generated_projection_watch_paths(
+            &project_path,
+            "alias/missing/nested/runtime.locald.json",
+        );
+        assert_eq!(
+            paths,
+            HashSet::from([
+                project_path.join("alias/missing/nested/runtime.locald.json"),
+                project_path.join("real/missing/nested/runtime.locald.json"),
+            ]),
+            "canonical ancestor spelling survives multiple absent path components"
+        );
+        assert_eq!(
+            generated_source_watch_candidates(
+                &project_path,
+                &project_path.join("real/missing/nested/runtime.locald.json"),
+            ),
+            vec![project_path.join("real")],
+            "the existing canonical directory can be watched before materialization"
+        );
+
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).expect("create outside directory");
+        symlink(&outside, project_path.join("escape")).expect("link outside ancestor");
+        assert_eq!(
+            generated_projection_watch_paths(&project_path, "escape/missing/runtime.json"),
+            HashSet::from([project_path.join("escape/missing/runtime.json")]),
+            "pending lexical repairs remain observable without watching outside the project"
+        );
+    }
+
+    #[test]
+    fn generated_projection_watch_paths_preserve_case_sensitive_distinct_paths() {
+        let root = tempdir().expect("create case-sensitive projection watch fixture");
+        let project_path = std::fs::canonicalize(root.path()).expect("canonical project");
+        std::fs::create_dir(project_path.join("Chat")).expect("create mixed-case directory");
+        if project_path.join("chat").exists() {
+            return;
+        }
+        std::fs::create_dir(project_path.join("chat")).expect("create distinct directory");
+        let upper = generated_projection_watch_paths(&project_path, "Chat/runtime.json");
+        let lower = generated_projection_watch_paths(&project_path, "chat/runtime.json");
+        assert_eq!(
+            upper,
+            HashSet::from([project_path.join("Chat/runtime.json")])
+        );
+        assert_eq!(
+            lower,
+            HashSet::from([project_path.join("chat/runtime.json")])
+        );
+        assert!(upper.is_disjoint(&lower));
+    }
+
     #[test]
     fn generated_source_recheck_coalesces_when_the_reload_queue_is_full() {
         let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(1);
@@ -44518,6 +44597,118 @@ project_path = "chat/runtime.locald.json"
             .get_mut(&canonical_project)
             .expect("fixture watcher")
             .watcher = watcher;
+    }
+
+    #[tokio::test]
+    async fn case_varied_projection_paths_watch_canonical_parents_and_reconcile_events() {
+        let dir = tempdir().expect("create case-varied projection watcher root");
+        let name = "case-varied-projection";
+        let project_path = dir.path().join(name);
+        std::fs::create_dir_all(project_path.join("Chat"))
+            .expect("create mixed-case projection directory");
+        let canonical_parent =
+            std::fs::canonicalize(project_path.join("Chat")).expect("canonical parent");
+        if std::fs::canonicalize(project_path.join("chat")).ok() != Some(canonical_parent.clone()) {
+            return;
+        }
+        // The fixture config spells this existing directory `chat`; both the
+        // active and pending declarations must follow its actual `Chat` spelling.
+        let (manager, config, key, project_path, _) =
+            projected_reuse_fixture(dir.path(), name).await;
+        let canonical_project = ProcessManager::canonicalize_path(&project_path);
+        let canonical_active = canonical_parent.join("runtime.locald.json");
+        assert!(manager.loaded_generated_sources_match(key.instance()).await);
+        watch_config_with_manual_events(&manager, &project_path).await;
+        let mut candidate = config.clone();
+        let ServiceConfig::Typed(TypedServiceConfig::Worker(worker)) =
+            candidate.services.get_mut("worker").expect("worker")
+        else {
+            panic!("worker config");
+        };
+        worker
+            .common
+            .generated
+            .get_mut("runtime")
+            .expect("generated declaration")
+            .project_path = Some("CHAT/pending/runtime.locald.json".to_owned());
+        manager
+            .update_generated_source_watches(&project_path, &candidate)
+            .await;
+        let canonical_pending = canonical_parent.join("pending/runtime.locald.json");
+        assert!(!canonical_pending.exists());
+        {
+            let watchers = manager.watchers.lock().await;
+            let watcher = watchers.get(&canonical_project).expect("watcher");
+            assert!(watcher.generated_directories.contains(&canonical_parent));
+            assert_eq!(
+                watcher.pending_generated_projections,
+                HashSet::from([
+                    canonical_project.join("CHAT/pending/runtime.locald.json"),
+                    canonical_pending.clone(),
+                ]),
+                "pending candidates retain canonical spelling before their parent or leaf exists"
+            );
+            let projections = watcher
+                .generated_projections
+                .lock()
+                .expect("projection paths");
+            assert!(projections.contains(&canonical_pending));
+            assert!(projections.contains(&canonical_active));
+            assert!(projections.contains(&canonical_project.join("chat/runtime.locald.json")));
+        }
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(10);
+        manager
+            .watchers
+            .lock()
+            .await
+            .get_mut(&canonical_project)
+            .expect("watcher")
+            .reload_tx = reload_tx;
+        let repaired_parent = canonical_parent.join("pending");
+        std::fs::create_dir(&repaired_parent).expect("repair candidate parent");
+        manager
+            .reconcile_generated_projection_event(
+                &project_path,
+                std::slice::from_ref(&repaired_parent),
+            )
+            .await;
+        reload_rx
+            .try_recv()
+            .expect("canonical parent repair queues pending retry with healthy active projection");
+
+        manager
+            .refresh_generated_source_watches(&project_path, &config, false)
+            .await;
+        for replacement in [None, Some(b"foreign replacement".as_slice())] {
+            if let Some(bytes) = replacement {
+                std::fs::write(&canonical_active, bytes).expect("replace active projection");
+            } else {
+                std::fs::remove_file(&canonical_active).expect("remove active projection");
+            }
+            {
+                let watchers = manager.watchers.lock().await;
+                let watcher = watchers.get(&canonical_project).expect("watcher");
+                assert!(watcher.pending_generated_projections.is_empty());
+                assert!(watcher.generated_directories.contains(&canonical_parent));
+                assert!(projection_reconciliation_event_is_relevant(
+                    std::slice::from_ref(&canonical_active),
+                    &watcher
+                        .generated_projections
+                        .lock()
+                        .expect("projection paths"),
+                ));
+            }
+            assert!(
+                manager
+                    .generated_projection_change_requires_reconciliation(key.instance())
+                    .await,
+                "canonical removal and replacement events reach active integrity reconciliation"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&canonical_active).expect("read replacement"),
+            b"foreign replacement"
+        );
     }
 
     #[tokio::test]
