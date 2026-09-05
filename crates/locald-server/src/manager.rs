@@ -433,6 +433,7 @@ struct ConfigWatcher {
     reload_tx: tokio::sync::mpsc::Sender<()>,
     generated_sources: Arc<StdMutex<HashSet<PathBuf>>>,
     generated_projections: Arc<StdMutex<HashSet<PathBuf>>>,
+    pending_generated_projections: HashSet<PathBuf>,
     generated_directories: HashSet<PathBuf>,
     invalidated_generated_watch_paths: Arc<StdMutex<HashSet<PathBuf>>>,
 }
@@ -6420,52 +6421,27 @@ impl ProcessManager {
             }
         });
 
-        let (projection_tx, mut projection_rx) = tokio::sync::mpsc::channel::<()>(100);
+        let (projection_tx, mut projection_rx) = tokio::sync::mpsc::channel::<Vec<PathBuf>>(100);
         let projection_manager = self.clone();
         let projection_project_path = path.clone();
         tokio::spawn(async move {
             loop {
-                if projection_rx.recv().await.is_none() {
+                let Some(paths) = projection_rx.recv().await else {
                     break;
-                }
+                };
+                let mut changed_paths = paths.into_iter().collect::<HashSet<_>>();
                 loop {
                     let timeout = tokio::time::sleep(std::time::Duration::from_millis(500));
                     tokio::select! {
                         event = projection_rx.recv() => {
-                            if event.is_none() {
-                                return;
-                            }
+                            let Some(paths) = event else { return; };
+                            changed_paths.extend(paths);
                         }
                         () = timeout => {
-                            let instance_id = match projection_manager
-                                .resolve_lifecycle_target(&projection_project_path)
-                                .await
-                            {
-                                Ok(LifecycleTargetResolution::Catalogued(target)) => {
-                                    Some(target.instance_id)
-                                }
-                                Ok(_) => None,
-                                Err(error) => {
-                                    warn!(
-                                        "Failed to resolve generated-file projection event for {}: {error}",
-                                        projection_project_path.display()
-                                    );
-                                    None
-                                }
-                            };
-                            if let Some(instance_id) = instance_id
-                                && projection_manager
-                                    .generated_projection_change_requires_reconciliation(instance_id)
-                                    .await
-                            {
-                                info!(
-                                    "Generated-file projection changed for {}; queuing reconciliation",
-                                    projection_project_path.display()
-                                );
-                                projection_manager
-                                    .queue_config_reload(&projection_project_path)
-                                    .await;
-                            }
+                            projection_manager.reconcile_generated_projection_event(
+                                &projection_project_path,
+                                &changed_paths.into_iter().collect::<Vec<_>>(),
+                            ).await;
                             break;
                         }
                     }
@@ -6538,8 +6514,9 @@ impl ProcessManager {
                         if projection_relevant {
                             info!("Generated-file projection changed: {:?}", event.paths);
                             let tx = callback_projection_tx.clone();
+                            let paths = event.paths;
                             handle.spawn(async move {
-                                let _ = tx.send(()).await;
+                                let _ = tx.send(paths).await;
                             });
                         }
                     }
@@ -6564,6 +6541,7 @@ impl ProcessManager {
                             reload_tx: tx,
                             generated_sources,
                             generated_projections,
+                            pending_generated_projections: HashSet::new(),
                             generated_directories: HashSet::new(),
                             invalidated_generated_watch_paths,
                         },
@@ -6575,10 +6553,45 @@ impl ProcessManager {
     }
 
     async fn update_generated_source_watches(&self, project_path: &Path, config: &LocaldConfig) {
+        self.refresh_generated_source_watches(project_path, config, true)
+            .await;
+    }
+
+    async fn refresh_generated_source_watches(
+        &self,
+        project_path: &Path,
+        config: &LocaldConfig,
+        pending_candidate: bool,
+    ) {
         let project_path = Self::canonicalize_path(project_path);
         let mut desired_sources = HashSet::new();
         let mut desired_projections = HashSet::new();
-        for service in config.services.values() {
+        let active_services = self
+            .services
+            .lock()
+            .await
+            .values()
+            .filter(|service| {
+                Self::canonicalize_path(&service.path) == project_path
+                    && service.generated_files.is_some()
+            })
+            .map(|service| service.service_config.clone())
+            .collect::<Vec<_>>();
+        let pending_projections = if pending_candidate {
+            config
+                .services
+                .values()
+                .flat_map(|service| service.generated().values())
+                .filter_map(|generated| generated.project_path.as_ref())
+                .map(|path| project_path.join(path))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        // Candidate preparation may fail while the previous runtime remains
+        // live. Keep its source/projection watches until runtime publication
+        // succeeds and this union is refreshed from the new active services.
+        for service in config.services.values().chain(active_services.iter()) {
             for generated in service.generated().values() {
                 let configured = project_path.join(&generated.source);
                 desired_sources.insert(configured.clone());
@@ -6596,6 +6609,7 @@ impl ProcessManager {
         let Some(config_watcher) = watchers.get_mut(&project_path) else {
             return;
         };
+        config_watcher.pending_generated_projections = pending_projections;
         let watcher_sources = desired_sources.clone();
         *config_watcher
             .generated_sources
@@ -6729,6 +6743,52 @@ impl ProcessManager {
             }
         }
         true
+    }
+
+    async fn pending_projection_event_is_relevant(
+        &self,
+        project_path: &Path,
+        paths: &[PathBuf],
+    ) -> bool {
+        let watchers = self.watchers.lock().await;
+        watchers
+            .get(&Self::canonicalize_path(project_path))
+            .is_some_and(|watcher| {
+                projection_reconciliation_event_is_relevant(
+                    paths,
+                    &watcher.pending_generated_projections,
+                )
+            })
+    }
+
+    async fn reconcile_generated_projection_event(&self, project_path: &Path, paths: &[PathBuf]) {
+        let pending_candidate_changed = self
+            .pending_projection_event_is_relevant(project_path, paths)
+            .await;
+        let instance_id = match self.resolve_lifecycle_target(project_path).await {
+            Ok(LifecycleTargetResolution::Catalogued(target)) => Some(target.instance_id),
+            Ok(_) => None,
+            Err(error) => {
+                warn!(
+                    "Failed to resolve generated-file projection event for {}: {error}",
+                    project_path.display()
+                );
+                None
+            }
+        };
+        let active_projection_changed = if let Some(instance_id) = instance_id {
+            self.generated_projection_change_requires_reconciliation(instance_id)
+                .await
+        } else {
+            false
+        };
+        if pending_candidate_changed || active_projection_changed {
+            info!(
+                "Generated-file projection changed for {}; queuing reconciliation",
+                project_path.display()
+            );
+            self.queue_config_reload(project_path).await;
+        }
     }
 
     async fn generated_projection_change_requires_reconciliation(
@@ -8082,6 +8142,8 @@ impl ProcessManager {
         }
         debug_assert!(staged_service_runtimes.is_empty());
 
+        self.refresh_generated_source_watches(&path, &config, false)
+            .await;
         self.persist_state().await;
         if !self.loaded_generated_sources_match(instance_id).await {
             info!(
@@ -44291,6 +44353,195 @@ project_path = "chat/runtime.locald.json"
                 },
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn rejected_projection_candidate_preserves_active_watches_and_requeues_parent_repairs() {
+        let dir = tempdir().expect("create rejected-candidate watcher root");
+        let (manager, config, key, project_path, active_target) =
+            projected_reuse_fixture(dir.path(), "rejected-candidate").await;
+        let canonical_project = ProcessManager::canonicalize_path(&project_path);
+        manager.watch_config(project_path.clone()).await;
+        manager
+            .refresh_generated_source_watches(&project_path, &config, false)
+            .await;
+        let mut candidate = config.clone();
+        let ServiceConfig::Typed(TypedServiceConfig::Worker(worker)) =
+            candidate.services.get_mut("worker").expect("worker")
+        else {
+            panic!("worker config");
+        };
+        worker
+            .common
+            .generated
+            .get_mut("runtime")
+            .expect("generated declaration")
+            .project_path = Some("new-parent/runtime.locald.json".to_owned());
+        manager
+            .update_generated_source_watches(&project_path, &candidate)
+            .await;
+        projected_reuse_plan(&manager, &candidate, &key, &project_path)
+            .await
+            .expect_err(
+                "missing candidate parent rejects preparation without stopping active runtime",
+            );
+        assert!(manager.loaded_generated_sources_match(key.instance()).await);
+        {
+            let watchers = manager.watchers.lock().await;
+            let watcher = watchers.get(&canonical_project).expect("watcher");
+            let projections = watcher
+                .generated_projections
+                .lock()
+                .expect("projection paths");
+            assert!(projection_reconciliation_event_is_relevant(
+                std::slice::from_ref(&active_target),
+                &projections
+            ));
+            assert!(
+                watcher
+                    .generated_directories
+                    .contains(&canonical_project.join("chat"))
+            );
+        }
+        // Drive the same post-debounce handler directly, with an observable
+        // reload channel, so the regression depends on ordering rather than
+        // operating-system notification timing.
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(10);
+        manager
+            .watchers
+            .lock()
+            .await
+            .get_mut(&canonical_project)
+            .expect("watcher")
+            .reload_tx = reload_tx;
+        let parent = project_path.join("new-parent");
+        std::fs::create_dir(&parent).expect("repair missing candidate parent");
+        manager
+            .reconcile_generated_projection_event(&project_path, std::slice::from_ref(&parent))
+            .await;
+        reload_rx
+            .try_recv()
+            .expect("candidate parent repair queues reload despite healthy active projection");
+        projected_reuse_plan(&manager, &candidate, &key, &project_path)
+            .await
+            .expect("repaired candidate can now prepare");
+        std::fs::remove_file(&active_target)
+            .expect("remove active projection after rejected transition");
+        assert!(
+            manager
+                .generated_projection_change_requires_reconciliation(key.instance())
+                .await
+        );
+
+        // A committed replacement no longer retains the old generation's
+        // watches or any candidate-only retry trigger.
+        manager
+            .services
+            .lock()
+            .await
+            .get_mut(&key)
+            .expect("active service")
+            .generated_files = None;
+        manager
+            .refresh_generated_source_watches(&project_path, &candidate, false)
+            .await;
+        let watchers = manager.watchers.lock().await;
+        let watcher = watchers.get(&canonical_project).expect("watcher");
+        assert!(watcher.pending_generated_projections.is_empty());
+        assert!(
+            !watcher
+                .generated_projections
+                .lock()
+                .expect("projection paths")
+                .contains(&canonical_project.join("chat/runtime.locald.json"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_initial_projection_requeues_parent_repair_and_clears_on_commit() {
+        let dir = tempdir().expect("create initial projection watcher root");
+        let project_path = dir.path().join("project");
+        std::fs::create_dir(&project_path).expect("create project");
+        std::fs::write(project_path.join("source.json"), "{}").expect("write source");
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "initial-projection"
+[services.worker]
+type = "worker"
+command = "unused"
+[services.worker.env]
+PATH = "/usr/bin:/bin"
+[services.worker.generated.runtime]
+source = "source.json"
+project_path = "missing/runtime.locald.json"
+"#,
+        )
+        .expect("parse config");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "initial-projection").await;
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("set desired-up policy");
+        let creates = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(CountingStartFactory {
+                creates: creates.clone(),
+            }),
+        );
+        manager.watch_config(project_path.clone()).await;
+        manager
+            .converge_managed_instance(instance_id, None, false, true)
+            .await
+            .expect_err("missing initial parent rejects preparation");
+        assert_eq!(creates.load(Ordering::SeqCst), 0);
+        assert!(manager.loaded_generated_sources_match(instance_id).await);
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(10);
+        manager
+            .watchers
+            .lock()
+            .await
+            .get_mut(&ProcessManager::canonicalize_path(&project_path))
+            .expect("watcher")
+            .reload_tx = reload_tx;
+        let parent = project_path.join("missing");
+        std::fs::create_dir(&parent).expect("repair initial parent");
+        manager
+            .reconcile_generated_projection_event(&project_path, std::slice::from_ref(&parent))
+            .await;
+        reload_rx
+            .try_recv()
+            .expect("parent repair queues initial candidate retry");
+        manager
+            .reload_config(project_path.clone())
+            .await
+            .expect("queued reload starts the repaired candidate");
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+        assert!(parent.join("runtime.locald.json").exists());
+        manager
+            .reconcile_generated_projection_event(
+                &project_path,
+                &[parent.join("runtime.locald.json")],
+            )
+            .await;
+        assert!(
+            reload_rx.try_recv().is_err(),
+            "committed self-publication event does not queue another candidate retry"
+        );
+        manager
+            .stop_service_instance_locked(&ServiceKey::new(instance_id, "worker"))
+            .await
+            .expect("stop fixture service");
     }
 
     #[tokio::test]

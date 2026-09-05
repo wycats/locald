@@ -413,12 +413,8 @@ pub(crate) fn validate_declarations(config: &LocaldConfig) -> Result<()> {
                 validate_project_path(service_name, name, &generated.source, project_path)?;
                 // Conservatively reserve canonical caseless identities, including
                 // Unicode-equivalent directory components on macOS filesystems.
-                let normalized: String = normalized_relative_path(project_path)
-                    .to_string_lossy()
-                    .nfd()
-                    .case_fold()
-                    .nfd()
-                    .collect();
+                let normalized =
+                    canonical_caseless(&normalized_relative_path(project_path).to_string_lossy());
                 if let Some((existing_service, existing_name, existing_path)) = project_targets
                     .insert(
                         normalized,
@@ -2795,6 +2791,10 @@ async fn prepare_projection_target(
     })
 }
 
+fn canonical_caseless(value: &str) -> String {
+    value.nfd().case_fold().nfd().collect()
+}
+
 fn selected_projection_entry_name(
     parent: &Dir,
     requested_name: &Path,
@@ -2818,7 +2818,9 @@ fn selected_projection_entry_name(
         if entry_name
             .to_str()
             .zip(requested_name.to_str())
-            .is_some_and(|(actual, requested)| actual.eq_ignore_ascii_case(requested))
+            .is_some_and(|(actual, requested)| {
+                canonical_caseless(actual) == canonical_caseless(requested)
+            })
         {
             anyhow::ensure!(
                 case_match.is_none(),
@@ -5383,6 +5385,47 @@ project_path = "chat/two.locald.json"
             .await
             .expect("restore owned bytes");
         generated.cleanup().await.expect("cleanup owned projection");
+    }
+
+    #[tokio::test]
+    async fn unicode_equivalent_owned_projection_names_remain_admissible() {
+        for (actual, requested) in [
+            ("café.json", "CAFÉ.json"),
+            ("café.json", "cafe\u{301}.json"),
+        ] {
+            let root = tempdir().expect("create Unicode projection root");
+            tokio::fs::write(root.path().join("source.json"), "{}")
+                .await
+                .expect("write source");
+            let config = projected_service_config("source.json", actual, BTreeMap::new());
+            let generated = materialize(
+                &root.path().join("data"),
+                root.path(),
+                &key(),
+                &config,
+                &bindings(),
+            )
+            .await
+            .expect("materialize")
+            .expect("generated set");
+            let parent =
+                Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open parent");
+            let metadata = parent.symlink_metadata(actual).expect("owned metadata");
+            assert_eq!(
+                selected_projection_entry_name(&parent, Path::new(requested), &metadata)
+                    .expect("Unicode selector finds the exact owned entry"),
+                Path::new(actual)
+            );
+            // Exercise the entire preflight on filesystems that resolve these
+            // Unicode spellings to the same entry (including default macOS).
+            if parent.symlink_metadata(requested).is_ok() {
+                let renamed = projected_service_config("source.json", requested, BTreeMap::new());
+                prepare(root.path(), &key(), &renamed, Some(&generated))
+                    .await
+                    .expect("Unicode-equivalent spelling preserves owned-entry authorization");
+            }
+            generated.cleanup().await.expect("cleanup projection");
+        }
     }
 
     #[tokio::test]
