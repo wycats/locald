@@ -32,6 +32,7 @@ const MAX_GENERATED_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_GENERATED_SOURCE_BYTES_U64: u64 = 1024 * 1024;
 const PROJECTION_MANIFEST_NAME: &str = ".projection-ownership.json";
 const PROJECTION_MANIFEST_VERSION: u32 = 3;
+const WRITE_PROBE_JOURNAL: &str = "ownership.json";
 #[cfg(target_os = "macos")]
 const PROJECTION_PROVENANCE_XATTR: &[u8] = b"com.locald.projection-id\0";
 #[cfg(target_os = "linux")]
@@ -133,6 +134,23 @@ struct ProjectionManifest {
     version: u32,
     generation: String,
     projections: Vec<ProjectionOwnership>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct WriteProbeJournal {
+    version: u32,
+    attempt_identity: ProjectionFileIdentity,
+    ownership: ProjectionOwnership,
+    complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteProbeCheckpoint {
+    Journaled,
+    Exposed,
+    Quarantined,
+    Deleted,
+    Completed,
 }
 
 struct RenderedGeneration {
@@ -268,6 +286,18 @@ pub(crate) fn retained_generated_file_set(error: &anyhow::Error) -> Option<Gener
 }
 
 impl GeneratedFileSet {
+    /// Exact recorded ownership paths, independent of the current configuration.
+    pub(crate) fn projection_paths(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.projections
+            .iter()
+            .map(|projection| {
+                (
+                    projection.canonical_project_root.clone(),
+                    projection.relative_path.clone(),
+                )
+            })
+            .collect()
+    }
     pub(crate) fn path(&self, name: &str) -> Option<&Path> {
         self.paths.get(name).map(PathBuf::as_path)
     }
@@ -611,7 +641,22 @@ async fn ensure_prepared_projection_filesystems(
     // writer. Keep it outside generation garbage collection, including restart
     // cleanup of manifest-less staging directories.
     let probe_root = data_dir.join("projection-write-probes");
+    let mut directories_to_sync = Vec::new();
+    for path in probe_root.ancestors() {
+        directories_to_sync.push(path.to_path_buf());
+        if tokio::fs::try_exists(path).await? {
+            break;
+        }
+    }
     create_private_directory(&probe_root, true).await?;
+    tokio::task::spawn_blocking(move || {
+        for path in directories_to_sync {
+            std::fs::File::open(path)?.sync_all()?;
+        }
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .context("write-probe root durability task failed")??;
     verify_prepared_projection_writes(prepared, &probe_root).await
 }
 
@@ -649,22 +694,25 @@ async fn verify_prepared_projection_writes(
         .values()
         .filter_map(|source| source.projection.clone())
         .collect::<Vec<_>>();
-    let private_path = probe_root.join(format!(".write-probe-{}", uuid::Uuid::new_v4()));
-    create_private_directory(&private_path, false).await?;
+    let probe_root = probe_root.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let result = (|| {
         for projection in projections {
+            let private_path = probe_root.join(format!(".write-probe-{}", uuid::Uuid::new_v4()));
+            create_private_probe_directory(&private_path)?;
             let parent = open_exact_project_parent(
                 &projection.canonical_project_root,
                 &projection.project_root_identity,
                 &projection.parent_relative_path,
                 &projection.parent_identity,
             )?;
-            verify_projection_parent_write(
+            let result = verify_projection_parent_write(
                 &parent,
                 &private_path,
-                &projection.canonical_project_root.join(&projection.parent_relative_path),
-            ).with_context(|| {
+                &projection
+                    .canonical_project_root
+                    .join(&projection.parent_relative_path),
+            )
+            .with_context(|| {
                 format!(
                     "generated-file project_path parent `{}` cannot create projection entries",
                     projection
@@ -672,19 +720,15 @@ async fn verify_prepared_projection_writes(
                         .join(&projection.parent_relative_path)
                         .display()
                 )
-            })?;
+            });
+            match std::fs::remove_dir(&private_path) {
+                Ok(()) => {}
+                Err(error) if result.is_ok() => return Err(error.into()),
+                Err(_) => {}
+            }
+            result?;
         }
         Ok::<_, anyhow::Error>(())
-        })();
-        // A failed restoration may retain a foreign entry in private quarantine.
-        // Remove only an empty directory; its contents remain available for recovery.
-        match std::fs::remove_dir(&private_path) {
-            Ok(()) => result,
-            Err(error) => result.and_then(|()| Err(error.into())).with_context(|| format!(
-                "projection write-probe quarantine is retained at `{}`; inspect the reported entry before removing it",
-                private_path.display()
-            )),
-        }
     })
     .await
     .context("generated-file project_path write preflight task failed")?
@@ -709,11 +753,71 @@ fn verify_projection_parent_write_with_operations<F, G>(
     private_path: &Path,
     parent_path: &Path,
     bind_provenance: F,
-    mut rename: G,
+    rename: G,
 ) -> Result<()>
 where
     F: FnOnce(&cap_std::fs::File, &str) -> Result<()>,
     G: FnMut(&Dir, &Path, &Dir, &Path) -> std::io::Result<()>,
+{
+    verify_projection_parent_write_with_checkpoints(
+        parent,
+        private_path,
+        parent_path,
+        bind_provenance,
+        |from_root, from, to_root, to| from_root.hard_link(from, to_root, to),
+        rename,
+        |_, _| Ok(()),
+    )
+}
+
+fn create_private_probe_directory(path: &Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    Ok(())
+}
+
+fn write_probe_journal(root: &Dir, journal: &WriteProbeJournal, initial: bool) -> Result<()> {
+    use std::io::Write as _;
+    let name = if initial {
+        WRITE_PROBE_JOURNAL
+    } else {
+        "ownership.next.json"
+    };
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut file = root.open_with(name, &options)?;
+    file.write_all(&serde_json::to_vec(journal)?)?;
+    file.sync_all()?;
+    if !initial {
+        root.rename(name, root, WRITE_PROBE_JOURNAL)?;
+    }
+    root.open(".")?.sync_all()?;
+    Ok(())
+}
+
+fn verify_projection_parent_write_with_checkpoints<F, H, G, C>(
+    parent: &Dir,
+    private_path: &Path,
+    parent_path: &Path,
+    bind_provenance: F,
+    hard_link: H,
+    mut rename: G,
+    mut checkpoint: C,
+) -> Result<()>
+where
+    F: FnOnce(&cap_std::fs::File, &str) -> Result<()>,
+    H: FnOnce(&Dir, &Path, &Dir, &Path) -> std::io::Result<()>,
+    G: FnMut(&Dir, &Path, &Dir, &Path) -> std::io::Result<()>,
+    C: FnMut(WriteProbeCheckpoint, &WriteProbeJournal) -> Result<()>,
 {
     let private_root = Dir::open_ambient_dir(private_path, ambient_authority())?;
     ensure_projection_same_mount(
@@ -730,70 +834,295 @@ where
     options
         .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    let probe = private_root.open_with(&name, &options)?;
+    let seed = Path::new("seed");
+    let probe = private_root.open_with(seed, &options)?;
     let identity = projection_file_identity(&probe.metadata()?);
     let projection_id = uuid::Uuid::new_v4().to_string();
-    let mut exposed = false;
-    let result = (|| {
-        // Bind the inode privately. Unsupported provenance or no-replace rename
-        // fails before any entry is exposed in the user's project namespace.
+    let binding = (|| {
         bind_provenance(&probe, &projection_id)?;
         anyhow::ensure!(
             projection_provenance_matches(&probe, &projection_id)?,
             "generated-file project_path provenance probe did not round-trip"
         );
-        rename(&private_root, &name, parent, &name)
-            .context("generated-file project_path requires atomic no-replace quarantine support")?;
-        exposed = true;
-        let quarantine_name = PathBuf::from("quarantined-probe");
-        rename(parent, &name, &private_root, &quarantine_name).with_context(|| format!(
-        "projection write probe remains at `{}` because returning it to private quarantine failed; preserve and inspect this entry before retrying",
-        parent_path.join(&name).display()
-    ))?;
-        let parent_identity = projection_file_identity(&parent.dir_metadata()?);
-        let ownership = ProjectionOwnership {
-            name: "write-probe".to_owned(),
-            projection_id,
-            canonical_project_root: parent_path.to_path_buf(),
-            project_root_identity: parent_identity.clone(),
-            parent_relative_path: PathBuf::new(),
-            parent_identity,
-            file_name: name.clone(),
-            quarantine_root: private_path.to_path_buf(),
-            quarantine_root_identity: projection_file_identity(&private_root.dir_metadata()?),
-            relative_path: name.clone(),
-            target_quarantine_path: quarantine_name.clone(),
-            digest: Sha256::digest([]).into(),
-            size: 0,
-            identity: identity.clone(),
-        };
-        // Keep the original descriptor alive throughout quarantine validation,
-        // excluding inode reuse. The shared cleanup verifies inode, provenance,
-        // and empty contents, and restores foreign or modified entries safely.
-        cleanup_quarantined_projection_path_with_rename(
-            parent,
-            &private_root,
-            &ownership,
-            &name,
-            &quarantine_name,
-            &mut rename,
-        )
+        Ok::<_, anyhow::Error>(())
     })();
-    if !exposed {
-        let metadata = private_root.symlink_metadata(&name)?;
+    if let Err(error) = binding {
+        let metadata = private_root.symlink_metadata(seed)?;
         anyhow::ensure!(
             metadata.is_file()
                 && projection_file_identity(&metadata) == identity
                 && metadata.len() == 0,
             "private projection write probe changed before exposure; retaining the entry at `{}` for inspection",
-            private_path.join(&name).display()
+            private_path.join(seed).display()
         );
-        private_root
-            .remove_file(&name)
-            .context("failed to remove private write probe")?;
+        private_root.remove_file(seed)?;
+        return Err(error);
     }
+    // Qualify no-replace rename privately before the hard-link operation can
+    // expose a name. Keep the canonical seed name stable in the durable journal.
+    if let Err(error) = rename(&private_root, seed, &private_root, Path::new("seed-ready")) {
+        let metadata = private_root.symlink_metadata(seed)?;
+        anyhow::ensure!(
+            metadata.is_file()
+                && projection_file_identity(&metadata) == identity
+                && metadata.len() == 0
+                && projection_provenance_matches(&probe, &projection_id)?,
+            "private projection write probe changed before exposure; retaining the entry at `{}` for inspection",
+            private_path.join(seed).display()
+        );
+        private_root.remove_file(seed)?;
+        return Err(error)
+            .context("generated-file project_path requires atomic no-replace quarantine support");
+    }
+    rename_projection_noreplace(&private_root, Path::new("seed-ready"), &private_root, seed)?;
+    let mut seed_options = OpenOptions::new();
+    seed_options.read(true);
+    #[cfg(unix)]
+    seed_options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut selected_seed = private_root.open_with(seed, &seed_options)?;
+    anyhow::ensure!(
+        projection_file_identity(&selected_seed.metadata()?) == identity
+            && projection_provenance_matches(&selected_seed, &projection_id)?
+            && projection_contents_match_bounded(
+                &mut selected_seed,
+                0,
+                &Sha256::digest([]).into()
+            )?,
+        "private projection write probe changed before exposure; retaining `{}`",
+        private_path.join(seed).display()
+    );
+    probe.sync_all()?;
+    let quarantine_path = private_path.join("quarantine");
+    create_private_probe_directory(&quarantine_path)?;
+    let quarantine_root = Dir::open_ambient_dir(&quarantine_path, ambient_authority())?;
+    let quarantine_name = PathBuf::from("quarantined-probe");
+    let parent_identity = projection_file_identity(&parent.dir_metadata()?);
+    let ownership = ProjectionOwnership {
+        name: "write-probe".to_owned(),
+        projection_id,
+        canonical_project_root: parent_path.to_path_buf(),
+        project_root_identity: parent_identity.clone(),
+        parent_relative_path: PathBuf::new(),
+        parent_identity,
+        file_name: name.clone(),
+        quarantine_root: quarantine_path,
+        quarantine_root_identity: projection_file_identity(&quarantine_root.dir_metadata()?),
+        relative_path: name.clone(),
+        target_quarantine_path: quarantine_name.clone(),
+        digest: Sha256::digest([]).into(),
+        size: 0,
+        identity,
+    };
+    let mut journal = WriteProbeJournal {
+        version: 1,
+        attempt_identity: projection_file_identity(&private_root.dir_metadata()?),
+        ownership,
+        complete: false,
+    };
+    // The seed pins the owned inode across daemon crashes. Publish only after
+    // its provenance and complete recovery authority are durably recorded.
+    write_probe_journal(&private_root, &journal, true)?;
+    if let Some(root) = private_path.parent() {
+        std::fs::File::open(root)?.sync_all()?;
+    }
+    checkpoint(WriteProbeCheckpoint::Journaled, &journal)?;
+    if let Err(error) = hard_link(&private_root, seed, parent, &name) {
+        // Failure before publication leaves the public namespace unchanged.
+        finish_write_probe(&private_root, &mut journal)?;
+        return Err(error)
+            .context("generated-file project_path requires hard-link publication support");
+    }
+    parent.open(".")?.sync_all()?;
+    checkpoint(WriteProbeCheckpoint::Exposed, &journal)?;
+    if let Err(error) = rename(parent, &name, &quarantine_root, &quarantine_name) {
+        // The durable journal retains the exact public entry for startup recovery.
+        return Err(error).with_context(|| format!(
+            "generated-file project_path requires atomic no-replace quarantine support; write probe recovery is retained at `{}` for public entry `{}`",
+            private_path.display(), parent_path.join(&name).display()));
+    }
+    parent.open(".")?.sync_all()?;
+    quarantine_root.open(".")?.sync_all()?;
+    checkpoint(WriteProbeCheckpoint::Quarantined, &journal)?;
+    cleanup_quarantined_projection_path_with_rename(
+        parent,
+        &quarantine_root,
+        &journal.ownership,
+        &name,
+        &quarantine_name,
+        &mut rename,
+    )?;
+    checkpoint(WriteProbeCheckpoint::Deleted, &journal)?;
+    journal.complete = true;
+    write_probe_journal(&private_root, &journal, false)?;
+    checkpoint(WriteProbeCheckpoint::Completed, &journal)?;
+    finish_write_probe(&private_root, &mut journal)?;
     drop(probe);
-    result
+    Ok(())
+}
+
+fn finish_write_probe(attempt: &Dir, journal: &mut WriteProbeJournal) -> Result<()> {
+    if !journal.complete {
+        journal.complete = true;
+        write_probe_journal(attempt, journal, false)?;
+    }
+    // A durable completion fence precedes releasing the seed inode. Recovery of
+    // a completed attempt only handles private metadata, never a reused public name.
+    let mut seed = journal.ownership.clone();
+    seed.quarantine_root = journal
+        .ownership
+        .quarantine_root
+        .parent()
+        .context("probe attempt root")?
+        .to_path_buf();
+    seed.quarantine_root_identity = journal.attempt_identity.clone();
+    seed.target_quarantine_path = PathBuf::from("seed");
+    cleanup_orphaned_projection_quarantine(&seed)?;
+    match attempt.symlink_metadata("quarantine") {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_dir()
+                    && projection_file_identity(&metadata)
+                        == journal.ownership.quarantine_root_identity,
+                "retaining write probe because its quarantine identity changed at `{}`",
+                journal.ownership.quarantine_root.display()
+            );
+            attempt.remove_dir("quarantine")?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    anyhow::ensure!(
+        attempt
+            .entries()?
+            .all(|entry| entry.is_ok_and(|entry| entry.file_name() == WRITE_PROBE_JOURNAL)),
+        "write-probe attempt retains unrecognized private entries; inspect its journal directory"
+    );
+    attempt.remove_file(WRITE_PROBE_JOURNAL)?;
+    attempt.open(".")?.sync_all()?;
+    Ok(())
+}
+
+fn read_write_probe_journal(root: &Dir, name: &str) -> Result<WriteProbeJournal> {
+    use std::io::Read as _;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut bytes = Vec::new();
+    root.open_with(name, &options)?
+        .take(MAX_GENERATED_SOURCE_BYTES_U64 + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_GENERATED_SOURCE_BYTES,
+        "write-probe journal exceeds the recovery limit"
+    );
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("malformed write-probe ownership journal `{name}`"))
+}
+
+fn recover_write_probe(path: &Path) -> Result<()> {
+    let root = Dir::open_ambient_dir(path, ambient_authority())?;
+    if root.entries()?.next().is_none() {
+        std::fs::remove_dir(path)?;
+        return Ok(());
+    }
+    let mut journal = read_write_probe_journal(&root, WRITE_PROBE_JOURNAL)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let ownership = &journal.ownership;
+    anyhow::ensure!(
+        journal.version == 1
+            && journal.attempt_identity == projection_file_identity(&root.dir_metadata()?)
+            && ownership.quarantine_root == path.join("quarantine")
+            && ownership.parent_relative_path.as_os_str().is_empty()
+            && ownership.file_name.components().count() == 1
+            && matches!(
+                ownership.file_name.components().next(),
+                Some(Component::Normal(_))
+            )
+            && ownership.relative_path == ownership.file_name
+            && ownership.target_quarantine_path == Path::new("quarantined-probe")
+            && ownership.canonical_project_root.is_absolute()
+            && ownership.size == 0
+            && ownership.digest == <[u8; 32]>::from(Sha256::digest([])),
+        "write-probe journal has invalid or changed recovery authority"
+    );
+    match root.symlink_metadata("ownership.next.json") {
+        Ok(_) => {
+            let completed = read_write_probe_journal(&root, "ownership.next.json")?;
+            let mut expected = journal.clone();
+            expected.complete = true;
+            anyhow::ensure!(
+                completed == expected,
+                "retaining mismatched write-probe completion record at `{}`",
+                path.join("ownership.next.json").display()
+            );
+            root.rename("ownership.next.json", &root, WRITE_PROBE_JOURNAL)?;
+            root.open(".")?.sync_all()?;
+            journal = completed;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let ownership = &journal.ownership;
+    if !journal.complete {
+        // Unlike a retired service, an incomplete probe keeps its exact parent
+        // obligation until it can be inspected; changed roots are actionable.
+        open_exact_project_parent(
+            &ownership.canonical_project_root,
+            &ownership.project_root_identity,
+            &ownership.parent_relative_path,
+            &ownership.parent_identity,
+        )?;
+        // Verify the seed without deleting it, pinning the inode throughout any
+        // public/quarantine lookup and cleanup after a daemon crash.
+        let seed = root.open_with("seed", &options)?;
+        ensure_retained_projection(
+            projection_file_identity(&seed.metadata()?) == ownership.identity
+                && projection_provenance_matches(&seed, &ownership.projection_id)?,
+            || "write-probe seed ownership changed; retaining recovery state".to_owned(),
+        )?;
+        // In-place public edits also edit this hard-linked seed. The shared
+        // quarantine validator classifies their contents as retained user data.
+        cleanup_owned_projection_path(ownership)?;
+    }
+    finish_write_probe(&root, &mut journal)?;
+    std::fs::remove_dir(path).with_context(|| {
+        format!(
+            "write-probe attempt retains unrecognized entries at `{}`",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+async fn recover_write_probes(data_dir: &Path) -> Result<Vec<String>> {
+    let root = data_dir.join("projection-write-probes");
+    tokio::task::spawn_blocking(move || {
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut errors = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_name().to_string_lossy().starts_with(".write-probe-") { continue; }
+            let path = entry.path();
+            let result = if entry.file_type()?.is_dir() {
+                recover_write_probe(&path)
+            } else { anyhow::bail!("write-probe attempt is not a directory at `{}`", path.display()) };
+            if let Err(error) = result {
+                let message = format!("write-probe recovery retained at `{}`: {error:#}", path.display());
+                if error.chain().any(|cause| cause.downcast_ref::<RetainedProjectionError>().is_some()) {
+                    tracing::warn!(error = %message, "Retaining write-probe recovery for inspection");
+                } else { errors.push(message); }
+            }
+        }
+        Ok::<_, anyhow::Error>(errors)
+    }).await.context("write-probe startup recovery task failed")?
 }
 
 async fn publish_prepared(
@@ -2327,10 +2656,14 @@ pub(crate) async fn cleanup_instance(
 pub(crate) async fn cleanup_all_instances(
     data_dir: &Path,
 ) -> Result<Vec<StartupGeneratedFileCleanup>> {
+    let mut errors = recover_write_probes(data_dir).await?;
     let instances_root = data_dir.join("instances");
     let mut entries = match tokio::fs::read_dir(&instances_root).await {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            finish_cleanup_errors("generated-file write-probe recovery", &errors)?;
+            return Ok(Vec::new());
+        }
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
@@ -2341,7 +2674,6 @@ pub(crate) async fn cleanup_all_instances(
         }
     };
 
-    let mut errors = Vec::new();
     let mut retained = Vec::new();
     while let Some(entry) = entries.next_entry().await.with_context(|| {
         format!(
@@ -4608,6 +4940,306 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
+    fn projection_preflight_rejects_hard_link_denial_before_public_exposure() {
+        let root = tempdir().expect("public root");
+        let private = tempdir().expect("attempt root");
+        let parent = Dir::open_ambient_dir(root.path(), ambient_authority()).expect("parent");
+        let error = verify_projection_parent_write_with_checkpoints(
+            &parent,
+            private.path(),
+            root.path(),
+            set_projection_provenance,
+            |_, _, _, _| Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+            rename_projection_noreplace,
+            |_, _| Ok(()),
+        )
+        .expect_err("hard-link policy rejects admission");
+        assert!(format!("{error:#}").contains("hard-link publication support"));
+        assert_eq!(parent.entries().expect("public entries").count(), 0);
+        assert_eq!(
+            std::fs::read_dir(private.path())
+                .expect("private entries")
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn write_probe_startup_recovers_every_durable_checkpoint_without_instance_roots() {
+        for stop in [
+            WriteProbeCheckpoint::Journaled,
+            WriteProbeCheckpoint::Exposed,
+            WriteProbeCheckpoint::Quarantined,
+            WriteProbeCheckpoint::Deleted,
+            WriteProbeCheckpoint::Completed,
+        ] {
+            let root = tempdir().expect("recovery root");
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).expect("project");
+            let data = root.path().join("data");
+            let attempt = data.join("projection-write-probes/.write-probe-test");
+            create_private_directory(&attempt, true)
+                .await
+                .expect("attempt");
+            let parent = Dir::open_ambient_dir(&project, ambient_authority()).expect("parent");
+            let mut ownership = None;
+            verify_projection_parent_write_with_checkpoints(
+                &parent,
+                &attempt,
+                &project,
+                set_projection_provenance,
+                |from, source, to, target| from.hard_link(source, to, target),
+                rename_projection_noreplace,
+                |checkpoint, journal| {
+                    if checkpoint == stop {
+                        ownership = Some(journal.ownership.clone());
+                        anyhow::bail!("simulated daemon exit");
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("stop at durable boundary");
+            let ownership = ownership.expect("checkpoint observed");
+            assert!(attempt.join(WRITE_PROBE_JOURNAL).exists());
+            assert!(!data.join("instances").exists());
+            if stop == WriteProbeCheckpoint::Completed {
+                parent
+                    .write(&ownership.file_name, b"new public occupant")
+                    .expect("name reuse after completion");
+            }
+            cleanup_all_instances(&data)
+                .await
+                .expect("startup recovers probe without instances");
+            cleanup_all_instances(&data)
+                .await
+                .expect("repeated recovery is idempotent");
+            assert!(!attempt.exists());
+            if stop == WriteProbeCheckpoint::Completed {
+                assert_eq!(
+                    parent
+                        .read(&ownership.file_name)
+                        .expect("new occupant survives"),
+                    b"new public occupant"
+                );
+            } else {
+                assert_eq!(parent.entries().expect("public entries").count(), 0);
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn write_probe_recovery_preserves_changed_authority_and_contents() {
+        for change in [
+            "parent",
+            "quarantine",
+            "public-modified",
+            "quarantine-modified",
+            "journal",
+            "version",
+            "extra",
+        ] {
+            let root = tempdir().expect("recovery root");
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).expect("project");
+            let data = root.path().join("data");
+            let attempt = data.join("projection-write-probes/.write-probe-test");
+            create_private_directory(&attempt, true)
+                .await
+                .expect("attempt");
+            let parent = Dir::open_ambient_dir(&project, ambient_authority()).expect("parent");
+            let mut ownership = None;
+            let stop = if change == "quarantine-modified" {
+                WriteProbeCheckpoint::Quarantined
+            } else {
+                WriteProbeCheckpoint::Exposed
+            };
+            verify_projection_parent_write_with_checkpoints(
+                &parent,
+                &attempt,
+                &project,
+                set_projection_provenance,
+                |from, source, to, target| from.hard_link(source, to, target),
+                rename_projection_noreplace,
+                |checkpoint, journal| {
+                    if checkpoint == stop {
+                        ownership = Some(journal.ownership.clone());
+                        anyhow::bail!("simulated daemon exit");
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("stop with journal");
+            let ownership = ownership.expect("ownership");
+            match change {
+                "parent" => {
+                    std::fs::rename(&project, root.path().join("original-project"))
+                        .expect("move parent");
+                    std::fs::create_dir(&project).expect("replacement parent");
+                    std::fs::write(
+                        project.join(&ownership.file_name),
+                        b"foreign parent contents",
+                    )
+                    .expect("foreign file");
+                }
+                "quarantine" => {
+                    std::fs::rename(
+                        attempt.join("quarantine"),
+                        attempt.join("original-quarantine"),
+                    )
+                    .expect("move quarantine");
+                    std::fs::create_dir(attempt.join("quarantine"))
+                        .expect("replacement quarantine");
+                    std::fs::write(
+                        attempt.join("quarantine/quarantined-probe"),
+                        b"foreign quarantine contents",
+                    )
+                    .expect("foreign file");
+                }
+                "public-modified" => parent
+                    .write(&ownership.file_name, b"edited user data")
+                    .expect("modify public inode"),
+                "quarantine-modified" => std::fs::write(
+                    attempt.join("quarantine/quarantined-probe"),
+                    b"edited user data",
+                )
+                .expect("modify quarantined inode"),
+                "journal" => std::fs::write(attempt.join(WRITE_PROBE_JOURNAL), b"broken json")
+                    .expect("malformed journal"),
+                "version" => {
+                    let mut journal: WriteProbeJournal = serde_json::from_slice(
+                        &std::fs::read(attempt.join(WRITE_PROBE_JOURNAL)).expect("journal"),
+                    )
+                    .expect("decode");
+                    journal.version = 99;
+                    std::fs::write(
+                        attempt.join(WRITE_PROBE_JOURNAL),
+                        serde_json::to_vec(&journal).expect("encode"),
+                    )
+                    .expect("write version");
+                }
+                "extra" => {
+                    std::fs::write(attempt.join("user-note"), b"preserve note").expect("extra file")
+                }
+                _ => unreachable!(),
+            }
+            let error = recover_write_probe(&attempt)
+                .expect_err("changed state retains an actionable journal");
+            assert!(
+                attempt.join(WRITE_PROBE_JOURNAL).exists(),
+                "journal retained for {change}: {error:#}"
+            );
+            match change {
+                "public-modified" | "quarantine-modified" => {
+                    assert_eq!(
+                        parent
+                            .read(&ownership.file_name)
+                            .expect("edited contents remain public"),
+                        b"edited user data"
+                    );
+                    cleanup_all_instances(&data)
+                        .await
+                        .expect("retained user edits are warnings, not fatal startup failures");
+                }
+                "parent" => assert_eq!(
+                    std::fs::read(project.join(&ownership.file_name)).expect("foreign parent file"),
+                    b"foreign parent contents"
+                ),
+                "quarantine" => assert_eq!(
+                    std::fs::read(attempt.join("quarantine/quarantined-probe"))
+                        .expect("foreign quarantine file"),
+                    b"foreign quarantine contents"
+                ),
+                "extra" => assert_eq!(
+                    std::fs::read(attempt.join("user-note")).expect("retained note"),
+                    b"preserve note"
+                ),
+                _ => assert!(
+                    cleanup_all_instances(&data).await.is_err(),
+                    "invalid journal is reported"
+                ),
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn write_probe_recovery_promotes_only_exact_completion_records_and_removes_empty_attempts()
+     {
+        for record in ["exact", "partial", "mismatched"] {
+            let root = tempdir().expect("recovery root");
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).expect("project");
+            let data = root.path().join("data");
+            let attempt = data.join("projection-write-probes/.write-probe-test");
+            create_private_directory(&attempt, true)
+                .await
+                .expect("attempt");
+            let empty = data.join("projection-write-probes/.write-probe-empty");
+            create_private_directory(&empty, false)
+                .await
+                .expect("empty early attempt");
+            let parent = Dir::open_ambient_dir(&project, ambient_authority()).expect("parent");
+            let mut ownership = None;
+            verify_projection_parent_write_with_checkpoints(
+                &parent,
+                &attempt,
+                &project,
+                set_projection_provenance,
+                |from, source, to, target| from.hard_link(source, to, target),
+                rename_projection_noreplace,
+                |checkpoint, journal| {
+                    if checkpoint == WriteProbeCheckpoint::Deleted {
+                        ownership = Some(journal.ownership.clone());
+                        let mut complete = journal.clone();
+                        complete.complete = true;
+                        if record == "mismatched" {
+                            complete.ownership.projection_id = "foreign".to_owned();
+                        }
+                        let bytes = if record == "partial" {
+                            b"{partial".to_vec()
+                        } else {
+                            serde_json::to_vec(&complete)?
+                        };
+                        std::fs::write(attempt.join("ownership.next.json"), bytes)?;
+                        std::fs::File::open(attempt.join("ownership.next.json"))?.sync_all()?;
+                        anyhow::bail!("crash before completion rename");
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("completion interruption");
+            let ownership = ownership.expect("deleted checkpoint");
+            parent
+                .write(&ownership.file_name, b"later user file")
+                .expect("reuse public name");
+            let result = cleanup_all_instances(&data).await;
+            assert!(
+                !empty.exists(),
+                "empty attempt recovered regardless of another journal error"
+            );
+            assert_eq!(
+                parent
+                    .read(&ownership.file_name)
+                    .expect("user file preserved"),
+                b"later user file"
+            );
+            if record == "exact" {
+                result.expect("exact completion record recovered");
+                assert!(!attempt.exists());
+                cleanup_all_instances(&data).await.expect("repeat recovery");
+            } else {
+                let error = result.expect_err("unverified completion is retained");
+                assert!(format!("{error:#}").contains("ownership.next.json"));
+                assert!(attempt.join(WRITE_PROBE_JOURNAL).exists());
+                assert!(attempt.join("ownership.next.json").exists());
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
     fn projection_preflight_preserves_replaced_and_modified_entries_at_every_return_boundary() {
         for scenario in [
             "replaced",
@@ -4623,11 +5255,12 @@ mod tests {
                 Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open parent");
             let mut calls = 0;
             let mut public_name = PathBuf::new();
-            let error = verify_projection_parent_write_with_operations(
+            let error = verify_projection_parent_write_with_checkpoints(
                 &parent,
                 private.path(),
                 root.path(),
                 set_projection_provenance,
+                |from_root, from, to_root, to| from_root.hard_link(from, to_root, to),
                 |from_root, from, to_root, to| {
                     let step = calls;
                     calls += 1;
@@ -4638,15 +5271,20 @@ mod tests {
                         return Err(std::io::Error::from_raw_os_error(libc::EACCES));
                     }
                     rename_projection_noreplace(from_root, from, to_root, to)?;
-                    if step == 0 {
-                        public_name = to.to_path_buf();
+                    Ok(())
+                },
+                |step, journal| {
+                    if step == WriteProbeCheckpoint::Exposed {
+                        public_name = journal.ownership.file_name.clone();
                         if scenario != "modified" {
-                            to_root.remove_file(to)?;
+                            parent.remove_file(&public_name)?;
                         }
-                        to_root.write(to, b"user contents")?;
+                        parent.write(&public_name, b"user contents")?;
                     }
-                    if step == 1 && matches!(scenario, "collision" | "recovery-failure") {
-                        from_root.write(from, b"new occupant")?;
+                    if step == WriteProbeCheckpoint::Quarantined
+                        && matches!(scenario, "collision" | "recovery-failure")
+                    {
+                        parent.write(&public_name, b"new occupant")?;
                     }
                     Ok(())
                 },
@@ -4656,7 +5294,7 @@ mod tests {
             match scenario {
                 "restore-failure" | "recovery-failure" => {
                     assert_eq!(
-                        std::fs::read(private.path().join("quarantined-probe"))
+                        std::fs::read(private.path().join("quarantine/quarantined-probe"))
                             .expect("retained private contents"),
                         b"user contents"
                     );
@@ -4696,7 +5334,7 @@ mod tests {
             }
             if !matches!(scenario, "restore-failure" | "recovery-failure") {
                 assert_eq!(
-                    std::fs::read_dir(private.path())
+                    std::fs::read_dir(private.path().join("quarantine"))
                         .expect("read empty quarantine")
                         .count(),
                     0
@@ -4747,7 +5385,7 @@ mod tests {
     {
         let root = tempdir().expect("create recovery fixture");
         let data = root.path().join("data");
-        let private = data.join("projection-write-probes/retained-attempt");
+        let private = data.join("projection-write-probes/.write-probe-retained-attempt");
         create_private_directory(&private, true)
             .await
             .expect("private quarantine");
@@ -4760,11 +5398,12 @@ mod tests {
             .expect("stale generated output");
         let parent = Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open parent");
         let mut calls = 0;
-        verify_projection_parent_write_with_operations(
+        verify_projection_parent_write_with_checkpoints(
             &parent,
             &private,
             root.path(),
             set_projection_provenance,
+            |from_root, from, to_root, to| from_root.hard_link(from, to_root, to),
             |from_root, from, to_root, to| {
                 let step = calls;
                 calls += 1;
@@ -4772,9 +5411,12 @@ mod tests {
                     return Err(std::io::Error::from_raw_os_error(libc::EACCES));
                 }
                 rename_projection_noreplace(from_root, from, to_root, to)?;
-                if step == 0 {
-                    to_root.remove_file(to)?;
-                    to_root.write(to, b"retained user data")?;
+                Ok(())
+            },
+            |step, journal| {
+                if step == WriteProbeCheckpoint::Exposed {
+                    parent.remove_file(&journal.ownership.file_name)?;
+                    parent.write(&journal.ownership.file_name, b"retained user data")?;
                 }
                 Ok(())
             },
@@ -4785,11 +5427,23 @@ mod tests {
             !stale.exists(),
             "startup cleanup exercised stale generation removal"
         );
+        let restored = std::fs::read_dir(root.path())
+            .expect("public entries")
+            .map(|entry| entry.expect("entry").path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with(".locald-projection-write-probe-")
+                })
+            })
+            .expect("foreign quarantine restored with ownership checks");
         assert_eq!(
-            tokio::fs::read(private.join("quarantined-probe"))
-                .await
-                .expect("foreign quarantine survived"),
+            tokio::fs::read(restored).await.expect("restored content"),
             b"retained user data"
+        );
+        assert!(
+            private.join(WRITE_PROBE_JOURNAL).exists(),
+            "retained disposition remains actionable"
         );
     }
 
