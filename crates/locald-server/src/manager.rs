@@ -7321,6 +7321,19 @@ impl ProcessManager {
             )
             .await?;
 
+            if start_services {
+                // Explicit start must recover restored retained projections before
+                // preflight, independently of asynchronous watcher delivery. Finish
+                // this cleanup without cancellation so failed ownership records
+                // are returned to the deferred queue before checking admission again.
+                self.retry_deferred_generated_file_cleanups_for_instance(instance_id)
+                    .await;
+                self.ensure_publisher_candidate_convergence_current(
+                    publisher_cold_admission,
+                    publisher_preparation.as_ref(),
+                )?;
+            }
+
             let mut prepared_start_generated_files = HashMap::new();
             for (key, service_name) in generated_start_candidates {
                 let service_config = config
@@ -39981,6 +39994,138 @@ source = "config/nested/runtime.json"
     }
 
     #[tokio::test]
+    async fn explicit_start_recovers_restored_projection_before_preflight_without_sweeping_other_instances()
+     {
+        let dir = tempdir().expect("create explicit projection recovery root");
+        let project_path = dir.path().join("project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "explicit-recovery").await;
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("set desired-up policy");
+        std::fs::write(project_path.join("source.json"), "{}").expect("write source");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "explicit-recovery"
+[services.worker]
+type = "worker"
+command = "unused"
+[services.worker.env]
+PATH = "/usr/bin:/bin"
+[services.worker.generated.runtime]
+source = "source.json"
+project_path = "runtime.locald.json"
+"#,
+        )
+        .expect("write config");
+        let creates = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(CountingStartFactory {
+                creates: creates.clone(),
+            }),
+        );
+        manager
+            .converge_managed_instance(instance_id, None, false, true)
+            .await
+            .expect("initial start");
+        let canonical_project = ProcessManager::canonicalize_path(&project_path);
+        manager.watchers.lock().await.remove(&canonical_project);
+        let target = project_path.join("runtime.locald.json");
+        let owned = std::fs::read(&target).expect("read owned projection");
+        std::fs::write(&target, b"user modification").expect("modify projection");
+        let key = ServiceKey::new(instance_id, "worker");
+        manager
+            .stop("explicit-recovery:worker")
+            .await
+            .expect("stop retains modified projection");
+        assert!(
+            manager.services.lock().await[&key]
+                .generated_files
+                .is_none()
+        );
+        manager
+            .start_instance_service(instance_id, "worker")
+            .await
+            .expect_err("unrestored target remains protected");
+        assert_eq!(
+            std::fs::read(&target).expect("preserved modified file"),
+            b"user modification"
+        );
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+        // Restoration occurs with no watcher installed; the explicit start
+        // must recover synchronously instead of depending on a debounced event.
+        manager.watchers.lock().await.remove(&canonical_project);
+        std::fs::write(&target, &owned).expect("restore recorded bytes");
+
+        let other_root = dir.path().join("other-project");
+        std::fs::create_dir(&other_root).expect("create unrelated project");
+        std::fs::write(other_root.join("source.json"), "{}").expect("write unrelated source");
+        let other_key = ServiceKey::new(test_instance_id(), "worker");
+        assert_ne!(other_key.instance(), instance_id);
+        let other_config = manager.services.lock().await[&key].service_config.clone();
+        let other_generated = crate::generated_files::materialize(
+            &manager.availability_data_dir,
+            &other_root,
+            &other_key,
+            &other_config,
+            &ServiceRuntimeBindings::new(None, BTreeMap::new()),
+        )
+        .await
+        .expect("materialize unrelated projection")
+        .expect("unrelated generated set");
+        let other_target = other_root.join("runtime.locald.json");
+        let other_owned = std::fs::read(&other_target).expect("read unrelated owned bytes");
+        std::fs::write(&other_target, b"other modification").expect("modify unrelated projection");
+        manager
+            .cleanup_generated_files_or_defer(&other_key, &other_generated)
+            .await
+            .expect_err("retain unrelated cleanup");
+        std::fs::write(&other_target, &other_owned).expect("restore unrelated bytes");
+
+        tokio::time::timeout(
+            TEST_STARTUP_BOUNDARY_TIMEOUT,
+            manager.start_instance_service(instance_id, "worker"),
+        )
+        .await
+        .expect("explicit recovery completes")
+        .expect("restored projection permits synchronous start");
+        assert_eq!(creates.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read(&target).expect("new active projection"),
+            owned
+        );
+        assert_eq!(
+            std::fs::read(&other_target).expect("unrelated projection remains untouched"),
+            other_owned
+        );
+        {
+            let pending = manager.deferred_generated_file_cleanups.lock().await;
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].instance_id, Some(other_key.instance()));
+        }
+        assert!(
+            !manager.services.lock().await[&key]
+                .warnings
+                .iter()
+                .any(|warning| warning == GENERATED_FILE_CLEANUP_WARNING)
+        );
+        manager
+            .retry_deferred_generated_file_cleanups_for_instance(other_key.instance())
+            .await;
+        manager
+            .stop("explicit-recovery:worker")
+            .await
+            .expect("stop fixture service");
+    }
+
+    #[tokio::test]
     async fn generated_cleanup_failure_does_not_prevent_stop_and_retries() {
         let dir = tempdir().expect("create generated-file lifecycle directory");
         let project_path = dir.path().join("generated-file-project");
@@ -44355,13 +44500,33 @@ project_path = "chat/runtime.locald.json"
             .await
     }
 
+    async fn watch_config_with_manual_events(manager: &ProcessManager, project_path: &Path) {
+        manager.watch_config(project_path.to_path_buf()).await;
+        // These tests drive the post-debounce handler explicitly. Keep native
+        // watch registration available, but give events one deterministic source:
+        // filesystem callbacks must not race the test's observable reload channel.
+        let canonical_project = ProcessManager::canonicalize_path(project_path);
+        let mut watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {})
+            .expect("create manually driven watcher");
+        watcher
+            .watch(&canonical_project, RecursiveMode::NonRecursive)
+            .expect("watch fixture project");
+        manager
+            .watchers
+            .lock()
+            .await
+            .get_mut(&canonical_project)
+            .expect("fixture watcher")
+            .watcher = watcher;
+    }
+
     #[tokio::test]
     async fn rejected_projection_candidate_preserves_active_watches_and_requeues_parent_repairs() {
         let dir = tempdir().expect("create rejected-candidate watcher root");
         let (manager, config, key, project_path, active_target) =
             projected_reuse_fixture(dir.path(), "rejected-candidate").await;
         let canonical_project = ProcessManager::canonicalize_path(&project_path);
-        manager.watch_config(project_path.clone()).await;
+        watch_config_with_manual_events(&manager, &project_path).await;
         manager
             .refresh_generated_source_watches(&project_path, &config, false)
             .await;
@@ -44499,7 +44664,7 @@ project_path = "missing/runtime.locald.json"
                 creates: creates.clone(),
             }),
         );
-        manager.watch_config(project_path.clone()).await;
+        watch_config_with_manual_events(&manager, &project_path).await;
         manager
             .converge_managed_instance(instance_id, None, false, true)
             .await
