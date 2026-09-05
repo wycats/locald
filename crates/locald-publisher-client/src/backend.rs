@@ -1616,7 +1616,9 @@ mod tests {
                 .expect("read kernel publisher peer audit token");
             let mut expected_proof = [0_u8; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES];
             for (bytes, word) in expected_proof
-                .chunks_exact_mut(size_of::<u32>())
+                .as_chunks_mut::<{ size_of::<u32>() }>()
+                .0
+                .iter_mut()
                 .zip(peer_token.val)
             {
                 bytes.copy_from_slice(&word.to_ne_bytes());

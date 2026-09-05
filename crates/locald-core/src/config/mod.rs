@@ -584,6 +584,14 @@ pub struct CommonServiceConfig {
 pub struct GeneratedFileConfig {
     /// Project-relative source JSON or JSONC file.
     pub source: String,
+    /// Optional project-relative JSON or JSONC path where the rendered file is
+    /// projected for tools that require a package-local configuration file.
+    ///
+    /// The private generated file remains the canonical interpolation result.
+    /// locald owns the projection for the lifetime of the service instance and
+    /// never adopts or overwrites a pre-existing project file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
     /// Existing JSON Pointer targets and their replacement values.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub replace: BTreeMap<String, serde_json::Value>,
@@ -1064,6 +1072,7 @@ listeners = ["chat"]
 
 [services.web.generated.microfrontends]
 source = "chat/microfrontends.jsonc"
+project_path = "chat/.microfrontends.locald.json"
 
 [services.web.generated.microfrontends.replace]
 "/applications/chat/development/local" = "${services.web.listeners.chat.port}"
@@ -1073,6 +1082,10 @@ source = "chat/microfrontends.jsonc"
         .expect("parse generated file config");
         let generated = &config.services["web"].generated()["microfrontends"];
         assert_eq!(generated.source, "chat/microfrontends.jsonc");
+        assert_eq!(
+            generated.project_path.as_deref(),
+            Some("chat/.microfrontends.locald.json")
+        );
         assert_eq!(
             generated.replace["/options/enabled"],
             serde_json::Value::Bool(true)

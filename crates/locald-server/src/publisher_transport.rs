@@ -2352,7 +2352,12 @@ mod tests {
         );
 
         let mut bytes = [0_u8; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES];
-        for (bytes, word) in bytes.chunks_exact_mut(size_of::<u32>()).zip(words) {
+        for (bytes, word) in bytes
+            .as_chunks_mut::<{ size_of::<u32>() }>()
+            .0
+            .iter_mut()
+            .zip(words)
+        {
             bytes.copy_from_slice(&word.to_ne_bytes());
         }
         MacOsAuditToken(bytes)
