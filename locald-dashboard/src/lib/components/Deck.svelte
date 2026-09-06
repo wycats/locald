@@ -6,7 +6,7 @@
 	import { cubicOut } from 'svelte/easing';
 	import { services } from '$lib/stores/services';
 	import { serviceIdentity } from '$lib/types';
-	import { publicationStateLabel } from '$lib/service-presentation';
+	import { publicationGuidance, publicationStateLabel } from '$lib/service-presentation';
 
 	interface Props {
 		monitored: string[];
@@ -55,11 +55,11 @@
 					<DaemonControlCenter />
 				{:else if service?.publication}
 					<div class="publication-panel">
-						<span>Externally managed</span>
+						<span>Started by another application</span>
 						<strong>{publicationStateLabel(service.publication.state)}</strong>
-						<p>{service.publication.explanation}</p>
-						{#if service.publication.next_step}
-							<p class="next-step">{service.publication.next_step}</p>
+						<p>{publicationGuidance(service.publication).explanation}</p>
+						{#if publicationGuidance(service.publication).next_step}
+							<p class="next-step">{publicationGuidance(service.publication).next_step}</p>
 						{/if}
 					</div>
 				{:else}

@@ -1,6 +1,10 @@
 <script lang="ts">
 	import { serviceIdentity, type ServiceStatus } from '$lib/types';
-	import { publicationStateLabel, serviceDisplayAuthority } from '$lib/service-presentation';
+	import {
+		publicationGuidance,
+		publicationStateLabel,
+		serviceDisplayAuthority
+	} from '$lib/service-presentation';
 	import { logs } from '$lib/stores/logs';
 	import { pendingActions } from '$lib/stores/actions';
 	import { RotateCw, Square, Play, ExternalLink, Settings } from 'lucide-svelte';
@@ -122,9 +126,9 @@
 			<div class="publication-state">
 				{publicationStateLabel(service.publication.state)}
 			</div>
-			<div class="publication-copy">{service.publication.explanation}</div>
-			{#if service.publication.next_step}
-				<div class="publication-next">{service.publication.next_step}</div>
+			<div class="publication-copy">{publicationGuidance(service.publication).explanation}</div>
+			{#if publicationGuidance(service.publication).next_step}
+				<div class="publication-next">{publicationGuidance(service.publication).next_step}</div>
 			{/if}
 		{:else}
 			{#each lastLogs as log (log.timestamp + '-' + log.message)}
@@ -140,7 +144,7 @@
 	<div class="footer">
 		<div class="actions">
 			{#if service.service_type === 'published'}
-				<span class="external-label">Externally managed</span>
+				<span class="external-label">Started by another application</span>
 			{:else if service.status === 'running'}
 				<button title="Restart" onclick={handleRestart} disabled={isPending}>
 					{#if isPending}
