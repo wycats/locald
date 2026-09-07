@@ -31,6 +31,16 @@ afterEach(() => {
 });
 
 describe('instance-scoped service projections', () => {
+	it('keeps pathless same-named instances in distinct project groups', () => {
+		const first = { ...base, path: null };
+		const second = { ...first, instance_id: 'second-instance' };
+		services.set([first, second]);
+		expect(get(projects)).toEqual([
+			{ name: 'example', path: null, services: [first] },
+			{ name: 'example', path: null, services: [second] }
+		]);
+	});
+
 	it('keeps identical display names from separate worktrees independent', () => {
 		const second = {
 			...base,

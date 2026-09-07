@@ -10,7 +10,7 @@
 	} from 'lucide-svelte';
 	import { getServiceInspect } from '$lib/api';
 	import { serviceIdentity, type ServiceInspectResponse } from '$lib/types';
-	import { publicationStateLabel } from '$lib/service-presentation';
+	import { publicationGuidance, publicationStateLabel } from '$lib/service-presentation';
 	import { copyToClipboard } from '$lib/utils/clipboard';
 	import Terminal from './Terminal.svelte';
 	import InteractiveTerminal from './InteractiveTerminal.svelte';
@@ -155,11 +155,11 @@
 			{:else if info}
 				{#if info.publication}
 					<div class="publication-panel">
-						<span class="publication-kind">Externally managed</span>
+						<span class="publication-kind">Started by another application</span>
 						<h3>{publicationStateLabel(info.publication.state)}</h3>
-						<p>{info.publication.explanation}</p>
-						{#if info.publication.next_step}
-							<p class="next-step">{info.publication.next_step}</p>
+						<p>{publicationGuidance(info.publication).explanation}</p>
+						{#if publicationGuidance(info.publication).next_step}
+							<p class="next-step">{publicationGuidance(info.publication).next_step}</p>
 						{/if}
 						<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
 						<a href={info.publication.origin} target="_blank" class="publication-origin">

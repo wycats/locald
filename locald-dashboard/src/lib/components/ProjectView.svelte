@@ -25,9 +25,12 @@
 	import type { ProjectListEntry } from '$lib/api';
 	import { serviceIdentity, type ServiceStatus } from '$lib/types';
 	import {
+		publicationGuidance,
 		managedServices,
 		serviceDisplayAuthority,
-		serviceLifecycleLabel
+		serviceLifecycleLabel,
+		serviceLifecycleSummary,
+		serviceActionName
 	} from '$lib/service-presentation';
 	import {
 		RotateCw,
@@ -103,20 +106,11 @@
 		).length
 	);
 
-	let runningCount = $derived(
-		managedProjectServices.filter((s: ServiceStatus) => s.status === 'running').length
-	);
-
-	let buildingCount = $derived(
-		managedProjectServices.filter((s: ServiceStatus) => s.status === 'building').length
-	);
-
-	let stoppedCount = $derived(managedProjectServices.length - runningCount - buildingCount);
-	let publishedCount = $derived(projectServices.length - managedProjectServices.length);
-
 	function isPending(service: ServiceStatus): boolean {
 		return $pendingActions.some(
-			(action) => action.serviceName === service.name && action.instanceId === service.instance_id
+			(action) =>
+				action.serviceName === serviceActionName(service) &&
+				action.instanceId === service.instance_id
 		);
 	}
 
@@ -156,9 +150,10 @@
 		service: ServiceStatus
 	) {
 		e.stopPropagation();
-		if (action === 'start') await startServiceWithFeedback(service.name, service.instance_id);
-		if (action === 'stop') await stopServiceWithFeedback(service.name, service.instance_id);
-		if (action === 'restart') await restartServiceWithFeedback(service.name, service.instance_id);
+		const name = serviceActionName(service);
+		if (action === 'start') await startServiceWithFeedback(name, service.instance_id);
+		if (action === 'stop') await stopServiceWithFeedback(name, service.instance_id);
+		if (action === 'restart') await restartServiceWithFeedback(name, service.instance_id);
 	}
 
 	async function handleProjectAction(action: 'resume' | 'pause' | 'always-on') {
@@ -296,18 +291,7 @@
 	{:else}
 		<div class="service-summary" aria-label="Service lifecycle summary">
 			<span>{projectServices.length} service{projectServices.length === 1 ? '' : 's'}</span>
-			{#if managedProjectServices.length > 0}
-				<span>{runningCount} running</span>
-			{/if}
-			{#if buildingCount > 0}
-				<span>{buildingCount} building</span>
-			{/if}
-			{#if stoppedCount > 0}
-				<span>{stoppedCount} stopped</span>
-			{/if}
-			{#if publishedCount > 0}
-				<span>{publishedCount} published</span>
-			{/if}
+			<span>{serviceLifecycleSummary(projectServices)}</span>
 		</div>
 		<div class="service-list">
 			{#each projectServices as service (serviceIdentity(service))}
@@ -340,7 +324,7 @@
 						<span class="service-name">{getDisplayName(service)}</span>
 						<span class="status-chip {service.status}">{serviceLifecycleLabel(service)}</span>
 
-						<span class="type-chip {type}">{type}</span>
+						<span class="type-chip {type}">{type === 'published' ? 'App-managed' : type}</span>
 
 						{#if inDeck}
 							<span class="deck-chip">In Deck</span>
@@ -362,9 +346,10 @@
 						{#if service.publication}
 							<span
 								class="publication-guidance"
-								title={service.publication.next_step ?? service.publication.explanation}
+								title={publicationGuidance(service.publication).next_step ??
+									publicationGuidance(service.publication).explanation}
 							>
-								{service.publication.explanation}
+								{publicationGuidance(service.publication).explanation}
 							</span>
 						{/if}
 					</div>
@@ -544,9 +529,10 @@
 
 	.availability-panel {
 		display: flex;
+		flex-wrap: wrap;
 		align-items: flex-start;
 		justify-content: space-between;
-		gap: 20px;
+		gap: 12px 20px;
 		margin-top: 16px;
 		padding: 14px 16px;
 		border: 1px solid #27272a;
@@ -563,6 +549,7 @@
 		border-color: rgba(245, 158, 11, 0.35);
 	}
 	.availability-copy {
+		flex: 1 1 240px;
 		min-width: 0;
 	}
 	.availability-heading,
@@ -600,7 +587,7 @@
 		font-size: 0.7rem;
 	}
 	.availability-actions {
-		justify-content: flex-end;
+		justify-content: flex-start;
 		flex-shrink: 0;
 	}
 	.project-action {

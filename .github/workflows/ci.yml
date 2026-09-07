@@ -79,6 +79,9 @@ jobs:
               - '.github/workflows/**'
             web:
               - 'locald-dashboard/**'
+              - 'e2e/node/locald-dashboard-e2e/**'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
               - 'locald-docs/**'
               - '.github/workflows/**'
             vscode:
@@ -230,6 +233,52 @@ jobs:
 
           pnpm -C locald-docs install --frozen-lockfile
           pnpm -C locald-docs build
+
+  dashboard-browser:
+    name: Dashboard Browser (${{ matrix.os }})
+    if: ${{ github.event_name != 'schedule' && needs.changes.outputs.only_macos != 'true' }}
+    needs: [changes]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: ${{ needs.changes.outputs.web == 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "25"
+
+      - name: Install pnpm
+        if: ${{ needs.changes.outputs.web == 'true' }}
+        uses: pnpm/action-setup@v2
+        with:
+          version: 10.25.0
+
+      - name: Build and test the isolated dashboard
+        if: ${{ needs.changes.outputs.web == 'true' }}
+        shell: bash
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_GC: "1"
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm -C locald-dashboard test
+          pnpm -C locald-dashboard check
+          pnpm -C locald-dashboard lint
+          pnpm -C locald-dashboard build
+          pnpm -C e2e/node/locald-dashboard-e2e exec playwright install --with-deps chromium
+          pnpm -C e2e/node/locald-dashboard-e2e test:service-cards
+
+      - name: Upload browser failure evidence
+        if: ${{ failure() && needs.changes.outputs.web == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-browser-${{ matrix.os }}
+          path: e2e/node/locald-dashboard-e2e/test-results/
 
   rust-fmt:
     name: Rust Format
