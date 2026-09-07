@@ -6,6 +6,8 @@
   "scripts": {
     "test": "playwright test --reporter=list",
     "test:ui": "playwright test --ui",
+    "test:service-cards": "playwright test --config=playwright.service-cards.config.ts",
+    "preview:service-cards": "node scripts/service-card-fixture.mjs",
     "test:debug": "playwright test --debug",
     "codegen": "playwright codegen",
     "screenshots": "node scripts/capture-dashboard-screenshots.mjs",

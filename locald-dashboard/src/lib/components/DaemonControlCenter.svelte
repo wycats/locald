@@ -84,7 +84,7 @@
 				</div>
 				<div class="stat">
 					<div class="stat-num">{publishedCount}</div>
-					<div class="stat-label">Published</div>
+					<div class="stat-label">App-managed</div>
 				</div>
 				<div class="stat">
 					<div class="stat-num">{runningCount}</div>

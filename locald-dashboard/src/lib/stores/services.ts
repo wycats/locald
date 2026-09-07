@@ -153,7 +153,7 @@ export const projects = derived(services, ($services) => {
 			groupName = parts.length > 1 ? parts[0] : 'default';
 		}
 
-		const groupKey = service.path ?? groupName;
+		const groupKey = service.path ?? service.instance_id ?? groupName;
 		const group = groups.get(groupKey) ?? {
 			name: groupName,
 			path: service.path,

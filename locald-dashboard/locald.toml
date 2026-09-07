@@ -4,4 +4,4 @@ domain = "dev.locald.localhost"
 
 [services.web]
 type = "exec"
-command = "pnpm dev --port $PORT"
+command = "pnpm dev --host 127.0.0.1 --port $PORT"
