@@ -39,6 +39,15 @@
 	let contextMenu: { x: number; y: number; project: ProjectListEntry } | null = null;
 
 	let collapsedSections: ProjectSection[] = ['Recent'];
+	$: selectedRecentPath =
+		$recentProjects.find((project) => project.project_path === selectedProject)?.project_path ??
+		null;
+	// Reveal the selection when it enters Recent; keep manual collapse available.
+	$: if (selectedRecentPath) revealRecent();
+
+	function revealRecent() {
+		collapsedSections = collapsedSections.filter((section) => section !== 'Recent');
+	}
 
 	const SECTION_COPY: Record<ProjectSection, { label: string; subtitle: string }> = {
 		Active: {
@@ -266,11 +275,11 @@
 							<button
 								class="group-title"
 								type="button"
-								aria-pressed={project.path ? selectedProject === project.path : undefined}
-								aria-expanded={project.path ? undefined : !isCollapsed}
+								aria-pressed={project.entry ? selectedProject === project.path : undefined}
+								aria-expanded={project.entry ? undefined : !isCollapsed}
 								title={project.path ?? project.name}
 								on:click={() =>
-									project.path
+									project.entry
 										? onSelectProject(selectedProject === project.path ? null : project.path)
 										: toggleGroupCollapse(project.key)}
 							>

@@ -264,6 +264,62 @@ test("Recent begins collapsed and expands without losing exact service identitie
   await expect(row(page, 0, "web:preview")).toBeVisible();
 });
 
+test("unlisted worktree headings collapse their exact group until project attachment arrives", async ({ page, request }) => {
+  const projects = await (await request.get("/api/projects")).json();
+  let attached = false;
+  await page.route("**/api/projects", route => route.fulfill({ json: attached ? projects : [projects[0]] }));
+  await page.reload();
+  const heading = page.locator('[data-project-path="/fixture/feature-b/shop"] .group-title');
+  await expect(heading).toHaveAttribute("aria-expanded", "true");
+  await expect(heading).not.toHaveAttribute("aria-pressed");
+  await heading.click();
+  await expect(heading).toHaveAttribute("aria-expanded", "false");
+  await expect(row(page, 1, "web:preview")).toHaveCount(0);
+  await expect(row(page, 0, "web:preview")).toBeVisible();
+  expect(new URL(page.url()).searchParams.get("project")).toBeNull();
+  await heading.press("Enter");
+  await expect(row(page, 1, "web:preview")).toBeVisible();
+  attached = true;
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(heading).toHaveAttribute("aria-pressed", "false");
+  await expect(heading).not.toHaveAttribute("aria-expanded");
+  await heading.click();
+  await expect(heading).toHaveAttribute("aria-pressed", "true");
+  await expect.poll(() => new URL(page.url()).searchParams.get("project")).toBe(projects[1].project_path);
+});
+
+test("a bookmarked Recent project reveals its selected checkout", async ({ page, request }) => {
+  const projects = await (await request.get("/api/projects")).json();
+  projects[1].section = "Recent";
+  await page.route("**/api/projects", route => route.fulfill({ json: projects }));
+  await page.goto(`/?project=${encodeURIComponent(projects[1].project_path)}`);
+  await expect(page.getByRole("button", { name: /^Recent · 1 project$/i })).toHaveAttribute("aria-expanded", "true");
+  const header = page.locator('[data-project-path="/fixture/feature-b/shop"]');
+  await expect(header.locator(".group-title")).toHaveAttribute("aria-pressed", "true");
+  await expect(header.getByTestId("checkout-label")).toHaveText("feature-b/shop");
+  await expect(row(page, 1, "web:preview")).toBeVisible();
+});
+
+test("a selected Active project stays visible when a refresh moves it into Recent", async ({ page, request }) => {
+  const projects = await (await request.get("/api/projects")).json();
+  await page.route("**/api/projects", route => route.fulfill({ json: projects }));
+  const header = page.locator('[data-project-path="/fixture/feature-b/shop"]');
+  await header.locator(".group-title").click();
+  await expect(header.locator(".group-title")).toHaveAttribute("aria-pressed", "true");
+  projects[1].section = "Recent";
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  const recent = page.getByRole("button", { name: /^Recent · 1 project$/i });
+  await expect(recent).toHaveAttribute("aria-expanded", "true");
+  await expect(header.locator(".group-title")).toHaveAttribute("aria-pressed", "true");
+  await expect(header.getByTestId("checkout-label")).toHaveText("feature-b/shop");
+  await expect(row(page, 1, "web:preview")).toBeVisible();
+  // Revealing the selection keeps explicit section controls usable afterward.
+  await recent.click();
+  await expect(recent).toHaveAttribute("aria-expanded", "false");
+  await recent.click();
+  await expect(header.locator(".group-title")).toHaveAttribute("aria-pressed", "true");
+});
+
 test("Tab reaches the persistent link and native link activation leaves selection unchanged", async ({ page, request }) => {
   const item = row(page, 0, "web:preview");
   const button = inspect(item, "web:preview");
