@@ -29,7 +29,8 @@
 		managedServices,
 		serviceDisplayAuthority,
 		serviceLifecycleLabel,
-		serviceLifecycleSummary
+		serviceLifecycleSummary,
+		serviceActionName
 	} from '$lib/service-presentation';
 	import {
 		RotateCw,
@@ -107,7 +108,9 @@
 
 	function isPending(service: ServiceStatus): boolean {
 		return $pendingActions.some(
-			(action) => action.serviceName === service.name && action.instanceId === service.instance_id
+			(action) =>
+				action.serviceName === serviceActionName(service) &&
+				action.instanceId === service.instance_id
 		);
 	}
 
@@ -147,9 +150,10 @@
 		service: ServiceStatus
 	) {
 		e.stopPropagation();
-		if (action === 'start') await startServiceWithFeedback(service.name, service.instance_id);
-		if (action === 'stop') await stopServiceWithFeedback(service.name, service.instance_id);
-		if (action === 'restart') await restartServiceWithFeedback(service.name, service.instance_id);
+		const name = serviceActionName(service);
+		if (action === 'start') await startServiceWithFeedback(name, service.instance_id);
+		if (action === 'stop') await stopServiceWithFeedback(name, service.instance_id);
+		if (action === 'restart') await restartServiceWithFeedback(name, service.instance_id);
 	}
 
 	async function handleProjectAction(action: 'resume' | 'pause' | 'always-on') {

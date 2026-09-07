@@ -279,14 +279,64 @@ test("unlisted worktree headings collapse their exact group until project attach
   expect(new URL(page.url()).searchParams.get("project")).toBeNull();
   await heading.press("Enter");
   await expect(row(page, 1, "web:preview")).toBeVisible();
+  await heading.press("Space");
+  await expect(row(page, 1, "web:preview")).toHaveCount(0);
   attached = true;
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(heading).toHaveAttribute("aria-pressed", "false");
   await expect(heading).not.toHaveAttribute("aria-expanded");
+  await expect(row(page, 1, "web:preview")).toBeVisible();
   await heading.click();
   await expect(heading).toHaveAttribute("aria-pressed", "true");
   await expect.poll(() => new URL(page.url()).searchParams.get("project")).toBe(projects[1].project_path);
 });
+
+for (const source of ["sidebar", "project"] as const) {
+  for (const status of [200, 500]) {
+    test(`pending ${source} restart locks matching controls across surfaces until HTTP ${status}`, async ({ page }) => {
+      await page.locator('[data-project-path="/fixture/feature-a/shop"] .group-title').click();
+      const projectRow = page.locator(".project-view .service-row").filter({ has: page.locator(`a[href="${longDestination}"]`) });
+      const item = row(page, 0, "web:preview");
+      const sidebarRestart = item.getByRole("button", { name: "Restart shop:web:preview", exact: true });
+      const projectRestart = projectRow.getByTitle("Restart", { exact: true });
+      const submitted: string[] = [];
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      await page.route("**/api/instances/*/services/*/*", async route => {
+        submitted.push(new URL(route.request().url()).pathname);
+        await held;
+        await route.fulfill({ status, json: status === 200 ? {} : { error: "Fixture restart failed" } });
+      });
+      try {
+        if (source === "sidebar") {
+          await addressButton(item, "web:preview").click();
+          await sidebarRestart.click();
+        } else {
+          await projectRow.hover();
+          await projectRestart.click();
+          await addressButton(item, "web:preview").click();
+        }
+        await expect.poll(() => submitted).toEqual([`/api/instances/${ids[0]}/services/web%3Apreview/restart`]);
+        await expect(sidebarRestart).toBeDisabled();
+        await expect(item.getByRole("button", { name: "Stop shop:web:preview", exact: true })).toBeDisabled();
+        await expect(projectRestart).toBeDisabled();
+        await expect(projectRow.getByTitle("Stop", { exact: true })).toBeDisabled();
+        await addressDialog(item, "web:preview").getByRole("button", { name: "Close service options", exact: true }).click();
+        const other = row(page, 1, "web:preview");
+        await addressButton(other, "web:preview").click();
+        await expect(other.getByRole("button", { name: "Restart shop:web:preview", exact: true })).toBeEnabled();
+        expect(submitted).toHaveLength(1);
+      } finally {
+        release();
+      }
+      await expect(projectRestart).toBeEnabled();
+      await addressDialog(row(page, 1, "web:preview"), "web:preview").getByRole("button", { name: "Close service options", exact: true }).click();
+      await addressButton(item, "web:preview").click();
+      await expect(sidebarRestart).toBeEnabled();
+      expect(new URL(page.url()).searchParams.get("project")).toBe("/fixture/feature-a/shop");
+    });
+  }
+}
 
 test("a bookmarked Recent project reveals its selected checkout", async ({ page, request }) => {
   const projects = await (await request.get("/api/projects")).json();

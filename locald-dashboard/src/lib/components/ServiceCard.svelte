@@ -3,7 +3,8 @@
 	import {
 		publicationGuidance,
 		publicationStateLabel,
-		serviceDisplayAuthority
+		serviceDisplayAuthority,
+		serviceActionName
 	} from '$lib/service-presentation';
 	import { logs } from '$lib/stores/logs';
 	import { pendingActions } from '$lib/stores/actions';
@@ -50,7 +51,7 @@
 	let lastLogs = $derived(serviceLogs.slice(-3));
 	let isPending = $derived(
 		$pendingActions.some(
-			(a) => a.serviceName === service.name && a.instanceId === service.instance_id
+			(a) => a.serviceName === serviceActionName(service) && a.instanceId === service.instance_id
 		)
 	);
 	let status = $derived.by((): StatusDotStatus => {
@@ -75,17 +76,17 @@
 
 	async function handleStart(e: Event) {
 		e.stopPropagation();
-		await startServiceWithFeedback(service.name, service.instance_id);
+		await startServiceWithFeedback(serviceActionName(service), service.instance_id);
 	}
 
 	async function handleStop(e: Event) {
 		e.stopPropagation();
-		await stopServiceWithFeedback(service.name, service.instance_id);
+		await stopServiceWithFeedback(serviceActionName(service), service.instance_id);
 	}
 
 	async function handleRestart(e: Event) {
 		e.stopPropagation();
-		await restartServiceWithFeedback(service.name, service.instance_id);
+		await restartServiceWithFeedback(serviceActionName(service), service.instance_id);
 	}
 
 	function getDisplayUrl(service: ServiceStatus) {

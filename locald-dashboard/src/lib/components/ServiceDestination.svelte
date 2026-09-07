@@ -25,8 +25,7 @@
 	$: published = isPublishedService(service);
 	$: pending = $pendingActions.some(
 		(action) =>
-			(action.serviceName === serviceActionName(service) || action.serviceName === service.name) &&
-			action.instanceId === service.instance_id
+			action.serviceName === serviceActionName(service) && action.instanceId === service.instance_id
 	);
 
 	let closeButton: HTMLButtonElement;

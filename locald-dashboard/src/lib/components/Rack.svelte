@@ -35,6 +35,15 @@
 	export let onToggleMonitor: (name: string | string[]) => void = () => {};
 
 	let collapsedGroups: string[] = [];
+	$: clearAttachedGroupCollapse($projectList);
+
+	function clearAttachedGroupCollapse(entries: ProjectListEntry[]) {
+		const retained = collapsedGroups.filter(
+			(key) => !entries.some((entry) => entry.project_path === key)
+		);
+		if (retained.length !== collapsedGroups.length) collapsedGroups = retained;
+	}
+
 	let keyboardFocus: string | null = null;
 	let contextMenu: { x: number; y: number; project: ProjectListEntry } | null = null;
 
