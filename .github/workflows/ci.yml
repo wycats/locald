@@ -76,12 +76,18 @@ jobs:
               - 'Cargo.lock'
               - 'clippy.toml'
               - 'rust-toolchain*'
+              - '.cargo/**'
+              - 'scripts/ci/**'
               - '.github/workflows/**'
             web:
               - 'locald-dashboard/**'
               - 'e2e/node/locald-dashboard-e2e/**'
               - 'pnpm-lock.yaml'
               - 'pnpm-workspace.yaml'
+              - 'package.json'
+              - '.npmrc'
+              - '.pnpmfile.cjs'
+              - 'docs/design/**'
               - 'locald-docs/**'
               - '.github/workflows/**'
             vscode:
@@ -394,7 +400,7 @@ jobs:
   # M2.0: macOS Build Verification (Tier 1)
   # ==========================================================================
   # This job verifies locald compiles and runs basic smoke tests on macOS.
-  # It gates on Rust changes to optimize the 10x cost of macOS runners.
+  # Rust and embedded dashboard/docs changes both need a fresh installable binary.
   # See: .private/MAP_AUDIT.md Phase M2 for the full macOS testing strategy.
   # ==========================================================================
   macos-build:
@@ -407,11 +413,15 @@ jobs:
 
       - name: Gate
         id: gate
-        run: echo "run=${{ needs.changes.outputs.rust }}" >> "$GITHUB_OUTPUT"
+        run: echo "run=${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.web == 'true' }}" >> "$GITHUB_OUTPUT"
 
-      - name: No Rust changes
+      - name: No binary or embedded asset changes
         if: ${{ steps.gate.outputs.run != 'true' }}
-        run: echo "No Rust changes; skipping macOS build."
+        run: echo "No Rust or embedded dashboard/docs changes; skipping macOS build."
+
+      - name: Test artifact packaging contract
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: python3 -B -m unittest discover -s scripts/ci -p 'test_*.py'
 
       - name: Install Rust
         if: ${{ steps.gate.outputs.run == 'true' }}
@@ -475,7 +485,7 @@ jobs:
           # Only Linux-specific crates are excluded (locald-shim uses Linux namespaces/cgroups).
           # The target-gated dependencies in locald-shim/Cargo.toml prevent caps/libcontainer
           # from being compiled on macOS.
-          cargo build --release --bin locald --features channel-stable
+          cargo build --locked --release -p locald-cli --bin locald --features channel-stable
 
       - name: Smoke test - version
         if: ${{ steps.gate.outputs.run == 'true' }}
@@ -486,6 +496,10 @@ jobs:
       - name: Smoke test - help
         if: ${{ steps.gate.outputs.run == 'true' }}
         run: ./target/release/locald --help
+
+      - name: Preserve smoke-tested stable binary
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: python3 scripts/ci/package_macos.py stage --binary target/release/locald --stage "$RUNNER_TEMP/locald-macos-stable"
 
       - name: Run unit tests (stable features)
         if: ${{ steps.gate.outputs.run == 'true' }}
@@ -513,6 +527,19 @@ jobs:
             --exclude locald-shim \
             --exclude locald-vmm \
             --exclude locald-e2e
+
+      - name: Package verified macOS binary
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: python3 scripts/ci/package_macos.py package --stage "$RUNNER_TEMP/locald-macos-stable" --output "$RUNNER_TEMP/locald-macos-artifact"
+
+      - name: Upload verified macOS binary
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: locald-macos-aarch64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/locald-macos-artifact/
+          if-no-files-found: error
+          retention-days: 14
 
   rust-tests-coverage:
     name: Rust Tests + Coverage
