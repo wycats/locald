@@ -86,7 +86,7 @@ trait RuntimeQuiescence {}
 impl<T> RuntimeQuiescence for T {}
 
 trait SetupPlatform {
-    fn install_system_trust(&self, certificate: &Path) -> Result<()>;
+    fn install_system_trust(&self, certificate: &Path, owner: &SetupOwner) -> Result<()>;
     fn quiesce_runtime(
         &self,
         owner: &SetupOwner,
@@ -101,8 +101,12 @@ trait SetupPlatform {
 struct SystemPlatform;
 
 impl SetupPlatform for SystemPlatform {
-    fn install_system_trust(&self, certificate: &Path) -> Result<()> {
-        crate::trust::install_ca_macos(certificate)
+    fn install_system_trust(&self, certificate: &Path, owner: &SetupOwner) -> Result<()> {
+        locald_utils::macos_trust::ensure_system_trust(certificate, (owner.uid, owner.gid), || {
+            eprintln!(
+                "Repairing macOS system trust for locald HTTPS; authorization may be requested (120-second limit). Trust verification completes before setup changes the running services."
+            );
+        })
     }
 
     fn quiesce_runtime(
@@ -634,7 +638,7 @@ fn run_setup_with(
     let ca = locald_utils::cert::repair_root_ca_in_dir(&paths.certs, owner.uid, owner.gid)
         .context("could not establish valid Root CA material")?;
     platform
-        .install_system_trust(&ca.paths.cert_path)
+        .install_system_trust(&ca.paths.cert_path, owner)
         .context("could not install Root CA into system trust")?;
     platform
         .retire_native_host_entries()
@@ -814,11 +818,18 @@ fn collect_report_for(caller: ReportCaller, _verbose: bool) -> Result<DoctorRepo
                 &mut problems,
                 "macos.ca.trust",
                 "Root CA is trusted by the macOS system trust store",
-                if locald_utils::cert::is_ca_path_trusted(&paths.certs.join("rootCA.pem")) {
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!("Root CA is not trusted by the system"))
-                },
+                owner_result.as_ref().map_or_else(
+                    |error| Err(anyhow::anyhow!("setup owner unavailable: {error}")),
+                    |owner| match locald_utils::macos_trust::probe(
+                        &paths.certs.join("rootCA.pem"),
+                        Some((owner.uid, owner.gid)),
+                    )? {
+                        locald_utils::macos_trust::TrustReadiness::Ready => Ok(()),
+                        state => Err(anyhow::anyhow!(
+                            "Root CA system trust is not ready: {state:?}"
+                        )),
+                    },
+                ),
             );
             push_check(
                 &mut problems,
@@ -1708,7 +1719,7 @@ mod tests {
     }
 
     impl SetupPlatform for RecordingPlatform {
-        fn install_system_trust(&self, _certificate: &Path) -> Result<()> {
+        fn install_system_trust(&self, _certificate: &Path, _owner: &SetupOwner) -> Result<()> {
             self.record("trust")
         }
 

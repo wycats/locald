@@ -840,39 +840,16 @@ pub fn is_ca_trusted() -> bool {
 #[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)]
 pub fn is_ca_path_trusted(ca_path: &Path) -> bool {
-    let Some(certs_dir) = ca_path.parent() else {
-        return false;
-    };
-    let Ok((probe_pem, ca_pem)) = ssl_trust_probe_pems(ca_path, &certs_dir.join("rootCA-key.pem"))
-    else {
-        return false;
-    };
-    let Ok(probe_file) = TemporarySecurityFile::new("ssl-trust-leaf", probe_pem.as_bytes()) else {
-        return false;
-    };
-    let Ok(ca_file) = TemporarySecurityFile::new("ssl-trust-root", &ca_pem) else {
-        return false;
-    };
-
-    let mut command = std::process::Command::new("/usr/bin/security");
-    command
-        .args(["verify-cert", "-c"])
-        .arg(&probe_file.path)
-        .arg("-c")
-        .arg(&ca_file.path)
-        .args(["-p", "ssl", "-n", "localhost", "-L", "-q"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    crate::process_spawn::ProcessSpawnBarrier::global()
-        .spawn_std_command(&mut command)
-        .and_then(|mut child| child.wait())
-        .is_ok_and(|status| status.success())
+    crate::macos_trust::probe(ca_path, None)
+        .is_ok_and(|state| state == crate::macos_trust::TrustReadiness::Ready)
 }
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)]
-fn ssl_trust_probe_pems(ca_path: &Path, ca_key_path: &Path) -> Result<(String, Vec<u8>)> {
+pub(crate) fn ssl_trust_probe_pems(
+    ca_path: &Path,
+    ca_key_path: &Path,
+) -> Result<(String, Vec<u8>)> {
     let ca_pem = read_regular_file_no_follow(ca_path, ROOT_CA_MAX_BYTES)?;
     let ca_key_pem =
         String::from_utf8(read_regular_file_no_follow(ca_key_path, ROOT_CA_MAX_BYTES)?)
@@ -923,14 +900,22 @@ fn open_regular_file_no_follow(path: &Path, maximum_bytes: u64) -> Result<File> 
 }
 
 #[cfg(target_os = "macos")]
-struct TemporarySecurityFile {
-    path: PathBuf,
+pub(crate) struct TemporarySecurityFile {
+    pub(crate) path: PathBuf,
 }
 
 #[cfg(target_os = "macos")]
 impl TemporarySecurityFile {
     #[allow(clippy::disallowed_methods)]
-    fn new(label: &str, bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn new(label: &str, bytes: &[u8]) -> Result<Self> {
+        Self::new_for_owner(label, bytes, None)
+    }
+
+    pub(crate) fn new_for_owner(
+        label: &str,
+        bytes: &[u8],
+        owner: Option<(u32, u32)>,
+    ) -> Result<Self> {
         let temporary = Self {
             path: Path::new("/private/tmp").join(format!(
                 "locald-{label}-{}.pem",
@@ -944,6 +929,13 @@ impl TemporarySecurityFile {
             .open(&temporary.path)
             .with_context(|| format!("Failed to create {}", temporary.path.display()))?;
         file.write_all(bytes)?;
+        if let Some((uid, gid)) = owner {
+            nix::unistd::fchown(
+                &file,
+                Some(nix::unistd::Uid::from_raw(uid)),
+                Some(nix::unistd::Gid::from_raw(gid)),
+            )?;
+        }
         Ok(temporary)
     }
 }

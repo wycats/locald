@@ -18,6 +18,9 @@ pub mod env;
 pub mod fs;
 /// IPC utilities.
 pub mod ipc;
+/// Bounded, fail-closed macOS system trust readiness and repair.
+#[cfg(target_os = "macos")]
+pub mod macos_trust;
 /// Notification server utilities (Linux only).
 #[cfg(target_os = "linux")]
 pub mod notify;
