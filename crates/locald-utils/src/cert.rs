@@ -840,8 +840,7 @@ pub fn is_ca_trusted() -> bool {
 #[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)]
 pub fn is_ca_path_trusted(ca_path: &Path) -> bool {
-    crate::macos_trust::probe(ca_path, None)
-        .is_ok_and(|state| state == crate::macos_trust::TrustReadiness::Ready)
+    crate::macos_trust::verify_https(ca_path).is_ok()
 }
 
 #[cfg(target_os = "macos")]

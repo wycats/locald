@@ -192,6 +192,19 @@ pub fn probe(certificate: &Path, owner: Option<(u32, u32)>) -> Result<TrustReadi
     probe_with(certificate, owner, &SystemSecurity)
 }
 
+/// Bounded effective HTTPS check for frequent health polling. Full System
+/// membership and administrative policy inspection belong to setup and doctor.
+pub(crate) fn verify_https(certificate: &Path) -> Result<()> {
+    verify_https_with(certificate, &SystemSecurity)
+}
+
+fn verify_https_with(certificate: &Path, runner: &impl SecurityRunner) -> Result<()> {
+    let directory = certificate.parent().context("CA path has no parent")?;
+    let (leaf, ca) =
+        crate::cert::ssl_trust_probe_pems(certificate, &directory.join("rootCA-key.pem"))?;
+    verify_https_pems(&leaf, &ca, None, runner)
+}
+
 fn probe_with(
     certificate: &Path,
     owner: Option<(u32, u32)>,
@@ -237,12 +250,22 @@ fn probe_with(
     if policy != TrustReadiness::Ready {
         return Ok(policy);
     }
+    verify_https_pems(&leaf, &ca, owner, runner)?;
+    Ok(TrustReadiness::Ready)
+}
+
+fn verify_https_pems(
+    leaf: &str,
+    ca: &[u8],
+    owner: Option<(u32, u32)>,
+    runner: &impl SecurityRunner,
+) -> Result<()> {
     let leaf = crate::cert::TemporarySecurityFile::new_for_owner(
         "ssl-trust-leaf",
         leaf.as_bytes(),
         owner,
     )?;
-    let ca = crate::cert::TemporarySecurityFile::new_for_owner("ssl-trust-root", &ca, owner)?;
+    let ca = crate::cert::TemporarySecurityFile::new_for_owner("ssl-trust-root", ca, owner)?;
     let mut command = security();
     command
         .arg("verify-cert")
@@ -258,7 +281,7 @@ fn probe_with(
         runner.run(&mut command, PROBE_TIMEOUT)?,
         "intended-user HTTPS verification (trust was not changed)",
     )?;
-    Ok(TrustReadiness::Ready)
+    Ok(())
 }
 
 fn system_contains(pems: &[u8], expected: &[u8]) -> Result<bool> {
@@ -337,8 +360,8 @@ fn administrative_policy(bytes: &[u8], certificate: &[u8]) -> Result<TrustReadin
             .and_then(plist::Value::as_unsigned_integer)
             .context("missing or malformed trust result")?;
         match result {
-            1 => {}
-            2 | 4 => sufficient = false,
+            1 | 2 => {}
+            4 => sufficient = false,
             3 => bail!(
                 "administrative trust explicitly denies this CA; inspect the policy before repairing trust"
             ),
@@ -478,7 +501,7 @@ mod tests {
     #[test]
     fn administrative_policy_preserves_denials_constraints_and_parse_errors() {
         let ca = certificate();
-        for result in [2, 4] {
+        for result in [1, 2, 4] {
             let mut setting = plist::Dictionary::new();
             setting.insert(
                 "kSecTrustSettingsResult".into(),
@@ -493,7 +516,11 @@ mod tests {
                     &ca
                 )
                 .unwrap(),
-                TrustReadiness::InsufficientAdministrativeTrust
+                if result == 4 {
+                    TrustReadiness::InsufficientAdministrativeTrust
+                } else {
+                    TrustReadiness::Ready
+                }
             );
         }
         for result in [0, 3, 5, 999] {
@@ -743,6 +770,73 @@ mod tests {
                 stdout,
                 stderr: vec![],
             })
+        }
+    }
+
+    #[test]
+    fn repeated_health_checks_only_invoke_effective_https_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let certs = directory.path().canonicalize().unwrap();
+        let owner = (
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        );
+        let ca = crate::cert::repair_root_ca_in_dir(&certs, owner.0, owner.1).unwrap();
+        for fail_verification in [false, true] {
+            for _ in 0..3 {
+                // Enter the fixture at its verifier stage: any certificate or
+                // policy export command on the polling path fails the test.
+                let fixture = ProbeFixture {
+                    ca: vec![],
+                    calls: Cell::new(2),
+                    fail_verification,
+                    system_member: false,
+                    admin_settings: None,
+                    fail_export: true,
+                };
+                let result = verify_https_with(&ca.paths.cert_path, &fixture);
+                assert_eq!(result.is_ok(), !fail_verification);
+                assert_eq!(fixture.calls.get(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn trust_as_root_requires_effective_https_and_never_requests_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        let certs = directory.path().canonicalize().unwrap();
+        let owner = (
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        );
+        let ca = crate::cert::repair_root_ca_in_dir(&certs, owner.0, owner.1).unwrap();
+        let mut setting = plist::Dictionary::new();
+        setting.insert(
+            "kSecTrustSettingsResult".into(),
+            plist::Value::Integer(2.into()),
+        );
+        for fail_verification in [false, true] {
+            let fixture = ProbeFixture {
+                ca: std::fs::read(&ca.paths.cert_path).unwrap(),
+                calls: Cell::new(0),
+                fail_verification,
+                system_member: true,
+                admin_settings: Some(plist::Value::Array(vec![plist::Value::Dictionary(
+                    setting.clone(),
+                )])),
+                fail_export: false,
+            };
+            let repairs = Cell::new(0);
+            let result = converge(
+                || probe_with(&ca.paths.cert_path, Some(owner), &fixture),
+                || {
+                    repairs.set(repairs.get() + 1);
+                    Ok(())
+                },
+            );
+            assert_eq!(result.is_ok(), !fail_verification);
+            assert_eq!(fixture.calls.get(), 3);
+            assert_eq!(repairs.get(), 0);
         }
     }
 
