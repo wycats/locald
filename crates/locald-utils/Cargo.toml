@@ -41,6 +41,8 @@ pem = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 x509-parser = "0.18.0"
+plist = "1.8"
+sha1 = "0.10"
 
 [dev-dependencies]
 proptest = "1.6.0"
