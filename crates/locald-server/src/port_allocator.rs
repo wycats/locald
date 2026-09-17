@@ -20,6 +20,8 @@ use anyhow::Result;
 #[derive(Clone, Debug)]
 pub struct PortAllocator {
     inner: Arc<Mutex<PortAllocatorInner>>,
+    #[cfg(test)]
+    reserve: fn(u16) -> std::io::Result<(u16, Vec<TcpListener>)>,
 }
 
 #[derive(Debug)]
@@ -59,6 +61,33 @@ impl PortAllocator {
             inner: Arc::new(Mutex::new(PortAllocatorInner {
                 pending: HashSet::new(),
             })),
+            #[cfg(test)]
+            reserve: reserve_loopback_port,
+        }
+    }
+
+    /// Inject socket reservation for deterministic allocation-policy tests.
+    #[cfg(test)]
+    pub(crate) fn with_reserver(
+        reserve: fn(u16) -> std::io::Result<(u16, Vec<TcpListener>)>,
+    ) -> Self {
+        Self {
+            reserve,
+            ..Self::new()
+        }
+    }
+
+    // Production always uses real sockets; only tests carry a per-allocator
+    // reservation function. Keep the dispatch call identical in both builds.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn reserve_port(&self, port: u16) -> std::io::Result<(u16, Vec<TcpListener>)> {
+        #[cfg(test)]
+        {
+            (self.reserve)(port)
+        }
+        #[cfg(not(test))]
+        {
+            reserve_loopback_port(port)
         }
     }
 
@@ -76,7 +105,7 @@ impl PortAllocator {
 
         // Try up to 100 times to get a port not in our pending set
         for _ in 0..100 {
-            let (port, listeners) = match reserve_loopback_port(0) {
+            let (port, listeners) = match self.reserve_port(0) {
                 Ok(reservation) => reservation,
                 Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
                 Err(error) => return Err(error.into()),
@@ -109,7 +138,7 @@ impl PortAllocator {
         }
 
         // A sticky port is reusable only when neither loopback family owns it.
-        let (port, listeners) = reserve_loopback_port(port).ok()?;
+        let (port, listeners) = self.reserve_port(port).ok()?;
 
         // Only insert after successful bind
         inner.pending.insert(port);
@@ -137,7 +166,7 @@ fn reserve_loopback_port(port: u16) -> std::io::Result<(u16, Vec<TcpListener>)> 
     Ok((port, listeners))
 }
 
-fn ipv6_unavailable(error: &std::io::Error) -> bool {
+pub(crate) fn ipv6_unavailable(error: &std::io::Error) -> bool {
     matches!(
         error.raw_os_error(),
         Some(nix::libc::EAFNOSUPPORT | nix::libc::EPROTONOSUPPORT | nix::libc::EADDRNOTAVAIL)
@@ -192,7 +221,13 @@ mod tests {
 
     #[test]
     fn ipv6_conflict_rejects_specific_port_without_retaining_ipv4() {
-        let ipv6 = TcpListener::bind("[::1]:0").expect("IPv6 fixture");
+        let ipv6 = match TcpListener::bind("[::1]:0") {
+            Err(error) if ipv6_unavailable(&error) => {
+                eprintln!("skipping IPv6 conflict fixture: {error}");
+                return;
+            }
+            result => result.expect("bind available IPv6 loopback"),
+        };
         let port = ipv6.local_addr().unwrap().port();
         let allocator = PortAllocator::new();
         assert!(allocator.try_allocate_specific(port).is_none());
@@ -206,11 +241,15 @@ mod tests {
         let allocator = PortAllocator::new();
         let mut guard = allocator.allocate().unwrap();
         let port = guard.port();
+        let ipv6_available = guard.listeners.len() == 2;
         assert!(TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_err());
-        assert!(TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).is_err());
+        if ipv6_available {
+            assert!(TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).is_err());
+        }
         guard.release_listener();
         let _ipv4 = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
-        let _ipv6 = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).unwrap();
+        let _ipv6 = ipv6_available
+            .then(|| TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).unwrap());
         assert!(
             allocator.try_allocate_specific(port).is_none(),
             "still pending"

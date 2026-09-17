@@ -1115,9 +1115,13 @@ mod tests {
     // single-family listener. This models Vite's IPv6-only localhost default,
     // as well as servers explicitly binding IPv4 loopback.
     async fn assert_loopback_readiness(address: std::net::IpAddr) {
-        let listener = tokio::net::TcpListener::bind((address, 0))
-            .await
-            .expect("bind single-family loopback endpoint");
+        let listener = match tokio::net::TcpListener::bind((address, 0)).await {
+            Err(error) if address.is_ipv6() && crate::port_allocator::ipv6_unavailable(&error) => {
+                eprintln!("skipping IPv6 readiness fixture: {error}");
+                return;
+            }
+            result => result.expect("bind single-family loopback endpoint"),
+        };
         let port = listener.local_addr().expect("listener address").port();
         // Accept the legacy probe Host, but reject bare localhost: changing
         // transport address family must not alter virtual-host authorization.
