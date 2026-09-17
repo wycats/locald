@@ -188,6 +188,10 @@ impl ReadinessRequirement {
 
     /// Evaluate the configured endpoint or command side of readiness once.
     ///
+    /// Managed endpoint probes use `localhost`, like the managed-service proxy,
+    /// so either IPv4-only or IPv6-only loopback listeners can satisfy readiness.
+    /// Keep the background monitors below on that same endpoint contract.
+    ///
     /// Controller state and process ownership remain manager-owned evidence.
     /// This probe is used when a preserved controller may have completed after
     /// the foreground readiness deadline but before the health monitor
@@ -205,14 +209,10 @@ impl ReadinessRequirement {
                 timeout,
                 ..
             } => {
-                locald_utils::probe::check_http(
-                    &format!("http://127.0.0.1:{port}{path}"),
-                    (*timeout).min(budget),
-                )
-                .await
+                locald_utils::probe::check_loopback_http(*port, path, (*timeout).min(budget)).await
             }
             Self::ExplicitTcp { port, timeout, .. } => {
-                locald_utils::probe::check_tcp(&format!("127.0.0.1:{port}"), (*timeout).min(budget))
+                locald_utils::probe::check_tcp(&format!("localhost:{port}"), (*timeout).min(budget))
                     .await
             }
             Self::ExplicitCommand {
@@ -228,7 +228,7 @@ impl ReadinessRequirement {
             }
             Self::AssignedPortTcp { port } | Self::ControllerAndAssignedPortTcp { port } => {
                 locald_utils::probe::check_tcp(
-                    &format!("127.0.0.1:{port}"),
+                    &format!("localhost:{port}"),
                     Duration::from_secs(DEFAULT_HEALTH_CHECK_TIMEOUT_SECS).min(budget),
                 )
                 .await
@@ -652,7 +652,6 @@ impl HealthMonitor {
         let monitor = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let url = format!("http://127.0.0.1:{port}{path}");
 
             loop {
                 {
@@ -668,7 +667,7 @@ impl HealthMonitor {
                         break;
                     }
                 }
-                if locald_utils::probe::check_http(&url, timeout).await {
+                if locald_utils::probe::check_loopback_http(port, &path, timeout).await {
                     monitor
                         .update_health(
                             &key,
@@ -787,7 +786,7 @@ impl HealthMonitor {
 
                 info!("About to probe {} on {}", display_name, assigned_port);
                 let result =
-                    locald_utils::probe::check_tcp(&format!("127.0.0.1:{assigned_port}"), timeout)
+                    locald_utils::probe::check_tcp(&format!("localhost:{assigned_port}"), timeout)
                         .await;
                 info!(
                     "Probing {} on {}... Success: {}",
@@ -1110,6 +1109,138 @@ mod tests {
                 .to_string()
                 .contains("requires `command`")
         );
+    }
+
+    // Exercise the catch-up path and background monitors against the same
+    // single-family listener. This models Vite's IPv6-only localhost default,
+    // as well as servers explicitly binding IPv4 loopback.
+    async fn assert_loopback_readiness(address: std::net::IpAddr) {
+        let listener = match tokio::net::TcpListener::bind((address, 0)).await {
+            Err(error) if address.is_ipv6() && crate::port_allocator::ipv6_unavailable(&error) => {
+                eprintln!("skipping IPv6 readiness fixture: {error}");
+                return;
+            }
+            result => result.expect("bind single-family loopback endpoint"),
+        };
+        let port = listener.local_addr().expect("listener address").port();
+        // Accept the legacy probe Host, but reject bare localhost: changing
+        // transport address family must not alter virtual-host authorization.
+        let expected_host = format!("127.0.0.1:{port}");
+        let app = axum::Router::new().route(
+            "/ready",
+            axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+                if headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|h| h.to_str().ok())
+                    == Some(expected_host.as_str())
+                {
+                    axum::http::StatusCode::OK
+                } else {
+                    axum::http::StatusCode::MISDIRECTED_REQUEST
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let interval = Duration::from_millis(20);
+        let timeout = Duration::from_secs(1);
+        assert!(
+            !locald_utils::probe::check_http(&format!("http://localhost:{port}/ready"), timeout)
+                .await,
+            "fixture rejects the changed bare-localhost Host header"
+        );
+        let requirements = [
+            ReadinessRequirement::ExplicitHttp {
+                port,
+                path: "/ready".to_owned(),
+                interval,
+                timeout,
+            },
+            ReadinessRequirement::ExplicitTcp {
+                port,
+                interval,
+                timeout,
+            },
+            ReadinessRequirement::AssignedPortTcp { port },
+            ReadinessRequirement::ControllerAndAssignedPortTcp { port },
+        ];
+        for requirement in requirements {
+            let ready = requirement.probe_once(None, &HashMap::new(), timeout).await;
+            if !ready {
+                server.abort();
+            }
+            assert!(
+                ready,
+                "{address}: catch-up probe failed for {requirement:?}"
+            );
+            let instance_id = instance_id("00000000-0000-4000-8000-000000000008");
+            let key = service_key(instance_id, "app:web");
+            let mut service = monitored_service(instance_id, legacy_config(None), Some(port));
+            service.runtime_state =
+                ServiceRuntime::Controller(Arc::new(Mutex::new(TestController {
+                    health_status: HealthStatus::Healthy,
+                })));
+            let services = Arc::new(Mutex::new(HashMap::from([(key.clone(), service)])));
+            let (events, _) = tokio::sync::broadcast::channel(8);
+            let monitor = HealthMonitor::new(
+                services.clone(),
+                events,
+                Arc::new(Mutex::new((None, None))),
+                SharedDomainIndex::default(),
+            );
+            monitor.spawn_check(
+                key.clone(),
+                "app:web".to_owned(),
+                1,
+                requirement.clone(),
+                Some(port),
+                None,
+                None,
+                None,
+            );
+            let observed = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let service = services.lock().await;
+                    if service[&key].health_status == HealthStatus::Healthy {
+                        return service[&key].health_source;
+                    }
+                    drop(service);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            services.lock().await.clear();
+            if observed.is_err() {
+                server.abort();
+            }
+            assert_eq!(
+                observed.expect("background monitor becomes healthy"),
+                requirement.health_source()
+            );
+        }
+        let unhealthy_path = ReadinessRequirement::ExplicitHttp {
+            port,
+            path: "/missing".to_owned(),
+            interval,
+            timeout,
+        };
+        let ready = unhealthy_path
+            .probe_once(None, &HashMap::new(), timeout)
+            .await;
+        server.abort();
+        assert!(
+            !ready,
+            "HTTP readiness must still require a successful response"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_readiness_accepts_ipv4_only_services() {
+        assert_loopback_readiness(std::net::Ipv4Addr::LOCALHOST.into()).await;
+    }
+
+    #[tokio::test]
+    async fn loopback_readiness_accepts_ipv6_only_services() {
+        assert_loopback_readiness(std::net::Ipv6Addr::LOCALHOST.into()).await;
     }
 
     #[tokio::test]

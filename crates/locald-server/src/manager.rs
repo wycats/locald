@@ -39515,8 +39515,26 @@ domains = ["workbench"]
 
     #[tokio::test]
     async fn named_listener_allocation_is_instance_scoped_sticky_and_releasable() {
+        fn reserve(port: u16) -> std::io::Result<(u16, Vec<std::net::TcpListener>)> {
+            static NEXT_PORT: std::sync::atomic::AtomicU16 =
+                std::sync::atomic::AtomicU16::new(30000);
+            Ok((
+                if port == 0 {
+                    NEXT_PORT.fetch_add(1, Ordering::SeqCst)
+                } else {
+                    port
+                },
+                Vec::new(),
+            ))
+        }
+
         let dir = tempdir().expect("create listener allocation directory");
-        let manager = readiness_test_manager(dir.path());
+        let mut manager = readiness_test_manager(dir.path());
+        // This is an allocation-policy test. Real sockets cannot guarantee
+        // reuse after stop releases them: another test/process may bind either
+        // family in that interval. Keep real dual-family socket coverage in
+        // port_allocator tests and the prepare-reservation integration test.
+        manager.port_allocator = PortAllocator::with_reserver(reserve);
         let service_config: ServiceConfig = toml::from_str(
             r#"
 command = "serve"
@@ -39618,6 +39636,31 @@ listeners = ["chat", "hmr"]
             .await
             .expect("reallocate sticky listeners");
         assert_eq!(restarted.bindings, sticky_bindings);
+        drop(restarted);
+
+        // A now-occupied sticky port must be replaced, while available sticky
+        // ports retain their identity. Pending guards model contention exactly.
+        let (occupied_name, occupied_port) = sticky_bindings.listeners().iter().next().unwrap();
+        let _occupied = manager
+            .port_allocator
+            .try_allocate_specific(*occupied_port)
+            .expect("reserve one stopped listener port");
+        let relocated = manager
+            .allocate_listener_runtime(
+                &first_key,
+                &service_config,
+                Some(first_primary.port()),
+                "app:web",
+            )
+            .await
+            .expect("relocate occupied sticky listener");
+        for (name, port) in sticky_bindings.listeners() {
+            if name == occupied_name {
+                assert_ne!(relocated.bindings.listeners()[name], *port);
+            } else {
+                assert_eq!(relocated.bindings.listeners()[name], *port);
+            }
+        }
 
         manager.remove_listener_runtime(&first_key).await;
         assert!(
