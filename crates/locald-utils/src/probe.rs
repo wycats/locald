@@ -25,6 +25,37 @@ pub async fn check_http(url: &str, timeout: Duration) -> bool {
     }
 }
 
+/// Probe either loopback family with the historical IPv4 Host authority.
+///
+/// DNS selection must not change virtual host semantics. Local readiness must
+/// not traverse an environment proxy.
+pub async fn check_loopback_http(port: u16, path: &str, timeout: Duration) -> bool {
+    let url = format!("http://localhost:{port}{path}");
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .timeout(timeout)
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            debug!("Failed to build loopback HTTP client: {error}");
+            return false;
+        }
+    };
+    match client
+        .get(&url)
+        .header(reqwest::header::HOST, format!("127.0.0.1:{port}"))
+        .send()
+        .await
+    {
+        Ok(response) => response.status().is_success(),
+        Err(error) => {
+            debug!("Loopback HTTP probe failed for {url}: {error}");
+            false
+        }
+    }
+}
+
 /// Checks if a TCP port is open.
 pub async fn check_tcp(addr: &str, timeout: Duration) -> bool {
     match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {

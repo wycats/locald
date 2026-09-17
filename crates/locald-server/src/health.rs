@@ -209,11 +209,7 @@ impl ReadinessRequirement {
                 timeout,
                 ..
             } => {
-                locald_utils::probe::check_http(
-                    &format!("http://localhost:{port}{path}"),
-                    (*timeout).min(budget),
-                )
-                .await
+                locald_utils::probe::check_loopback_http(*port, path, (*timeout).min(budget)).await
             }
             Self::ExplicitTcp { port, timeout, .. } => {
                 locald_utils::probe::check_tcp(&format!("localhost:{port}"), (*timeout).min(budget))
@@ -656,7 +652,6 @@ impl HealthMonitor {
         let monitor = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let url = format!("http://localhost:{port}{path}");
 
             loop {
                 {
@@ -672,7 +667,7 @@ impl HealthMonitor {
                         break;
                     }
                 }
-                if locald_utils::probe::check_http(&url, timeout).await {
+                if locald_utils::probe::check_loopback_http(port, &path, timeout).await {
                     monitor
                         .update_health(
                             &key,
@@ -1124,10 +1119,31 @@ mod tests {
             .await
             .expect("bind single-family loopback endpoint");
         let port = listener.local_addr().expect("listener address").port();
-        let app = axum::Router::new().route("/ready", axum::routing::get(|| async { "ready" }));
+        // Accept the legacy probe Host, but reject bare localhost: changing
+        // transport address family must not alter virtual-host authorization.
+        let expected_host = format!("127.0.0.1:{port}");
+        let app = axum::Router::new().route(
+            "/ready",
+            axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+                if headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|h| h.to_str().ok())
+                    == Some(expected_host.as_str())
+                {
+                    axum::http::StatusCode::OK
+                } else {
+                    axum::http::StatusCode::MISDIRECTED_REQUEST
+                }
+            }),
+        );
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
         let interval = Duration::from_millis(20);
         let timeout = Duration::from_secs(1);
+        assert!(
+            !locald_utils::probe::check_http(&format!("http://localhost:{port}/ready"), timeout)
+                .await,
+            "fixture rejects the changed bare-localhost Host header"
+        );
         let requirements = [
             ReadinessRequirement::ExplicitHttp {
                 port,

@@ -41,8 +41,8 @@ struct PortAllocatorInner {
 pub struct PortGuard {
     allocator: Arc<Mutex<PortAllocatorInner>>,
     port: u16,
-    /// The listener that reserves this port. Dropped when `release_listener()` is called.
-    listener: Option<TcpListener>,
+    /// Reserve both available loopback families until service launch.
+    listeners: Vec<TcpListener>,
 }
 
 impl Default for PortAllocator {
@@ -76,15 +76,18 @@ impl PortAllocator {
 
         // Try up to 100 times to get a port not in our pending set
         for _ in 0..100 {
-            let listener = TcpListener::bind("127.0.0.1:0")?;
-            let port = listener.local_addr()?.port();
+            let (port, listeners) = match reserve_loopback_port(0) {
+                Ok(reservation) => reservation,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(error) => return Err(error.into()),
+            };
 
             if inner.pending.insert(port) {
                 // Successfully inserted (was not already present)
                 return Ok(PortGuard {
                     allocator: self.inner.clone(),
                     port,
-                    listener: Some(listener),
+                    listeners,
                 });
             }
             // Port is in our pending set (rare but possible if OS recycles aggressively)
@@ -105,17 +108,40 @@ impl PortAllocator {
             return None;
         }
 
-        // Try to bind to the specific port
-        let listener = TcpListener::bind(format!("127.0.0.1:{port}")).ok()?;
+        // A sticky port is reusable only when neither loopback family owns it.
+        let (port, listeners) = reserve_loopback_port(port).ok()?;
 
         // Only insert after successful bind
         inner.pending.insert(port);
         Some(PortGuard {
             allocator: self.inner.clone(),
             port,
-            listener: Some(listener),
+            listeners,
         })
     }
+}
+
+/// Keep IPv4 and IPv6 reservations together for readiness and routing.
+///
+/// Only an unavailable IPv6 stack/loopback permits IPv4 alone; an occupied
+/// IPv6 port must reject the candidate, not be treated as absence.
+fn reserve_loopback_port(port: u16) -> std::io::Result<(u16, Vec<TcpListener>)> {
+    let ipv4 = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
+    let port = ipv4.local_addr()?.port();
+    let mut listeners = vec![ipv4];
+    match TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)) {
+        Ok(ipv6) => listeners.push(ipv6),
+        Err(error) if ipv6_unavailable(&error) => {}
+        Err(error) => return Err(error),
+    }
+    Ok((port, listeners))
+}
+
+fn ipv6_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(nix::libc::EAFNOSUPPORT | nix::libc::EPROTONOSUPPORT | nix::libc::EADDRNOTAVAIL)
+    )
 }
 
 impl PortGuard {
@@ -132,7 +158,7 @@ impl PortGuard {
     ///
     /// Call this immediately before starting the service that will use this port.
     pub fn release_listener(&mut self) {
-        self.listener = None;
+        self.listeners.clear();
     }
 
     /// Consume the guard and return the port, releasing both the listener and tracking.
@@ -140,7 +166,7 @@ impl PortGuard {
     /// Use this when you're confident the service has bound and tracking is no longer needed.
     #[must_use]
     pub fn take(mut self) -> u16 {
-        self.listener = None;
+        self.listeners.clear();
         let port = self.port;
         // Manually remove from pending set
         {
@@ -163,6 +189,47 @@ impl Drop for PortGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv6_conflict_rejects_specific_port_without_retaining_ipv4() {
+        let ipv6 = TcpListener::bind("[::1]:0").expect("IPv6 fixture");
+        let port = ipv6.local_addr().unwrap().port();
+        let allocator = PortAllocator::new();
+        assert!(allocator.try_allocate_specific(port).is_none());
+        let _ipv4 = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .expect("failed dual-family reservation releases IPv4");
+        assert!(!allocator.inner.lock().unwrap().pending.contains(&port));
+    }
+
+    #[test]
+    fn guard_reserves_and_releases_both_loopback_families() {
+        let allocator = PortAllocator::new();
+        let mut guard = allocator.allocate().unwrap();
+        let port = guard.port();
+        assert!(TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_err());
+        assert!(TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).is_err());
+        guard.release_listener();
+        let _ipv4 = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        let _ipv6 = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).unwrap();
+        assert!(
+            allocator.try_allocate_specific(port).is_none(),
+            "still pending"
+        );
+    }
+
+    #[test]
+    fn only_ipv6_unavailability_permits_single_family_reservation() {
+        for code in [
+            nix::libc::EAFNOSUPPORT,
+            nix::libc::EPROTONOSUPPORT,
+            nix::libc::EADDRNOTAVAIL,
+        ] {
+            assert!(ipv6_unavailable(&std::io::Error::from_raw_os_error(code)));
+        }
+        for code in [nix::libc::EADDRINUSE, nix::libc::EACCES] {
+            assert!(!ipv6_unavailable(&std::io::Error::from_raw_os_error(code)));
+        }
+    }
 
     #[test]
     fn allocates_unique_ports() {
