@@ -1,0 +1,342 @@
+---
+/*
+ * SurfacePatterns — the bottom "SURFACE PATTERNS" band from the Product Surface
+ * Grammar poster (page 03). Five mini-panels, each a small labeled specimen of
+ * a recurring product surface:
+ *   - Service Rows:    name chip + trailing status dot, three rows.
+ *   - Health Dots:     HEALTHY / DEGRADED / UNHEALTHY dot + label rows.
+ *   - Log Lines:       three compact stream lines.
+ *   - Local URLs:      lock + *.localhost domain + trailing status dot.
+ *   - Pinned Monitors: two stacked metric + sparkline rows.
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-3-grammar.png. Domains use
+ * *.localhost (written-guide rule), not the poster's .test.
+ */
+
+interface Props {
+  class?: string;
+}
+
+const { class: className } = Astro.props;
+
+const serviceRows = [
+  { name: "web", dot: "var(--locald-status-running)" },
+  { name: "api", dot: "var(--locald-status-running)" },
+  { name: "db", dot: "var(--locald-status-active)" },
+];
+
+const healthDots = [
+  { label: "HEALTHY", dot: "var(--locald-status-running)" },
+  { label: "DEGRADED", dot: "var(--locald-status-network)" },
+  { label: "UNHEALTHY", dot: "var(--locald-status-failed)" },
+];
+
+const logLines = [
+  { ts: "10:15:23", src: "web", msg: "GET /", status: "200", dur: "12ms" },
+  { ts: "10:15:23", src: "api", msg: "POST /v1/users", status: "201", dur: "38ms" },
+  { ts: "10:15:24", src: "worker", msg: "job_42", status: "ok", dur: "21ms" },
+];
+
+const urls = ["web.localhost", "api.localhost", "db.localhost"];
+
+const monitors = [
+  { a: "p95", av: "24ms", b: "RPS", bv: "128", tone: "var(--locald-status-active)" },
+  { a: "p95", av: "38ms", b: "FDs", bv: "67", tone: "var(--locald-status-running)" },
+];
+---
+
+<div class:list={["locald-patterns", className]}>
+  <!-- Service Rows -->
+  <section class="locald-pattern">
+    <p class="locald-pattern__label">Service Rows</p>
+    <div class="locald-pattern__body">
+      {
+        serviceRows.map((r) => (
+          <span class="locald-pattern__servicerow">
+            <span class="locald-pattern__cube" aria-hidden="true">
+              <svg width="13" height="13" viewBox="0 0 20 20" fill="none">
+                <path d="M10 2.5 16.5 6v8L10 17.5 3.5 14V6z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round" />
+                <path d="M10 2.5 16.5 6 10 9.5 3.5 6zM10 9.5v8" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round" />
+              </svg>
+            </span>
+            <span class="locald-pattern__name">{r.name}</span>
+            <span class="locald-pattern__dot" style={`background:${r.dot}`} />
+          </span>
+        ))
+      }
+    </div>
+  </section>
+
+  <!-- Health Dots -->
+  <section class="locald-pattern">
+    <p class="locald-pattern__label">Health Dots</p>
+    <div class="locald-pattern__body">
+      {
+        healthDots.map((h) => (
+          <span class="locald-pattern__health">
+            <span class="locald-pattern__dot" style={`background:${h.dot}`} />
+            <span class="locald-pattern__health-label">{h.label}</span>
+          </span>
+        ))
+      }
+    </div>
+  </section>
+
+  <!-- Log Lines -->
+  <section class="locald-pattern locald-pattern--wide">
+    <p class="locald-pattern__label">Log Lines</p>
+    <div class="locald-pattern__body locald-pattern__body--mono">
+      {
+        logLines.map((l) => (
+          <span class="locald-pattern__logline">
+            <span class="locald-pattern__log-src" data-src={l.src}>{l.src}</span>
+            <span class="locald-pattern__log-msg">{l.msg}</span>
+            <span class="locald-pattern__log-tail">{l.status}</span>
+          </span>
+        ))
+      }
+    </div>
+  </section>
+
+  <!-- Local URLs -->
+  <section class="locald-pattern">
+    <p class="locald-pattern__label">Local URLs</p>
+    <div class="locald-pattern__body">
+      {
+        urls.map((u) => (
+          <span class="locald-pattern__url">
+            <span class="locald-pattern__lock" aria-hidden="true">
+              <svg width="10" height="10" viewBox="0 0 11 11" fill="none">
+                <rect x="2" y="5" width="7" height="5" rx="1" stroke="currentColor" stroke-width="1" />
+                <path d="M3.5 5V3.5a2 2 0 0 1 4 0V5" stroke="currentColor" stroke-width="1" />
+              </svg>
+            </span>
+            <span class="locald-pattern__url-text">{u}</span>
+            <span class="locald-pattern__dot" style="background:var(--locald-status-network)" />
+          </span>
+        ))
+      }
+    </div>
+  </section>
+
+  <!-- Pinned Monitors -->
+  <section class="locald-pattern">
+    <p class="locald-pattern__label">Pinned Monitors</p>
+    <div class="locald-pattern__body">
+      {
+        monitors.map((m) => (
+          <span class="locald-pattern__monitor">
+            <span class="locald-pattern__monitor-metrics">
+              <span class="locald-pattern__monitor-row">
+                <span class="locald-pattern__monitor-k">{m.a}</span>
+                <span class="locald-pattern__monitor-v">{m.av}</span>
+              </span>
+              <span class="locald-pattern__monitor-row">
+                <span class="locald-pattern__monitor-k">{m.b}</span>
+                <span class="locald-pattern__monitor-v">{m.bv}</span>
+              </span>
+            </span>
+            <svg class="locald-pattern__monitor-spark" width="64" height="26" viewBox="0 0 64 26" fill="none" aria-hidden="true">
+              <path d="M1 18 L10 12 L19 15 L28 6 L37 13 L46 8 L55 14 L63 7" stroke={m.tone} stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </span>
+        ))
+      }
+    </div>
+  </section>
+</div>
+
+<style>
+  .locald-patterns {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: var(--locald-space-3);
+  }
+
+  .locald-pattern {
+    /* Reset Starlight's markdown-flow `* + *` top margin on sibling cards. */
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-md);
+    min-width: 0;
+    border: 1px solid var(--locald-border-subtle);
+    border-radius: var(--locald-radius-md);
+    background: var(--locald-surface-1);
+    padding: var(--locald-space-2);
+  }
+
+  .locald-pattern__label {
+    margin: 0;
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--locald-text-muted);
+  }
+
+  .locald-pattern__body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-sm);
+    min-width: 0;
+  }
+
+  .locald-pattern__dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    flex: none;
+  }
+
+  /* Service rows */
+  .locald-pattern__servicerow,
+  .locald-pattern__url {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    border: 1px solid var(--locald-border-subtle);
+    border-radius: var(--locald-radius-sm);
+    background: var(--locald-surface-2);
+    padding: var(--locald-gap-xs) var(--locald-gap-sm);
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-primary);
+  }
+
+  .locald-pattern__cube {
+    color: var(--locald-text-secondary);
+    flex: none;
+    display: inline-flex;
+  }
+
+  .locald-pattern__name {
+    flex: 1;
+  }
+
+  /* Health dots */
+  .locald-pattern__health {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    border: 1px solid var(--locald-border-subtle);
+    border-radius: var(--locald-radius-sm);
+    background: var(--locald-surface-2);
+    padding: var(--locald-gap-xs) var(--locald-gap-sm);
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-secondary);
+    letter-spacing: 0.04em;
+  }
+
+  /* Log lines */
+  .locald-pattern--wide {
+    grid-column: span 1;
+  }
+
+  .locald-pattern__body--mono {
+    border: 1px solid var(--locald-border-subtle);
+    border-radius: var(--locald-radius-sm);
+    background: var(--locald-surface-2);
+    padding: var(--locald-gap-sm);
+  }
+
+  .locald-pattern__logline {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: baseline;
+    gap: var(--locald-gap-xs) var(--locald-gap-sm);
+    font-family: var(--locald-font-mono);
+    font-size: 0.65rem;
+    white-space: nowrap;
+  }
+
+  .locald-pattern__log-ts {
+    color: var(--locald-text-muted);
+  }
+
+  .locald-pattern__log-src {
+    color: var(--locald-status-running);
+  }
+
+  .locald-pattern__log-src[data-src="api"] {
+    color: var(--locald-status-building);
+  }
+
+  .locald-pattern__log-src[data-src="worker"] {
+    color: var(--locald-status-active);
+  }
+
+  .locald-pattern__log-msg {
+    color: var(--locald-text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .locald-pattern__log-tail {
+    color: var(--locald-text-muted);
+    text-align: right;
+  }
+
+  /* Local URLs */
+  .locald-pattern__lock {
+    color: var(--locald-status-network);
+    flex: none;
+    display: inline-flex;
+  }
+
+  .locald-pattern__url-text {
+    flex: 1;
+    color: var(--locald-text-secondary);
+  }
+
+  /* Pinned monitors */
+  .locald-pattern__monitor {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-md);
+    border: 1px solid var(--locald-border-subtle);
+    border-radius: var(--locald-radius-sm);
+    background: var(--locald-surface-2);
+    padding: var(--locald-gap-sm);
+  }
+
+  .locald-pattern__monitor-metrics {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-family: var(--locald-font-mono);
+    font-size: 0.7rem;
+  }
+
+  .locald-pattern__monitor-row {
+    display: flex;
+    gap: var(--locald-gap-sm);
+  }
+
+  .locald-pattern__monitor-k {
+    color: var(--locald-text-muted);
+  }
+
+  .locald-pattern__monitor-v {
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-pattern__monitor-spark {
+    flex: 1;
+    min-width: 0;
+  }
+
+  @media (max-width: 60rem) {
+    .locald-patterns {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  @media (max-width: 36rem) {
+    .locald-patterns {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

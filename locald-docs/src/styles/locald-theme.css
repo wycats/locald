@@ -1,0 +1,68 @@
+/*
+ * locald Starlight theme mapping
+ *
+ * Maps Starlight's built-in CSS custom properties to locald design tokens so the
+ * docs shell adopts the locald visual language without scattering Starlight
+ * overrides across many files. Token values live in locald-tokens.css.
+ *
+ * locald is dark-first; we pin the dark palette as the canonical brand surface.
+ */
+
+/* Load brand fonts (variable). */
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+
+@import "./locald-tokens.css";
+@import "./locald-components.css";
+
+:root {
+  /* Brand fonts */
+  --sl-font: var(--locald-font-sans);
+  --sl-font-mono: var(--locald-font-mono);
+}
+
+/*
+ * Dark theme mapping. Starlight applies these on :root[data-theme='dark'] and,
+ * for the default dark experience, on :root as well. We map both so the brand
+ * surfaces hold regardless of toggle state.
+ */
+:root,
+:root[data-theme="dark"] {
+  /* Accent — locald uses the active (purple) family as the interactive accent. */
+  --sl-color-accent-low: #2a1f3d;
+  --sl-color-accent: var(--locald-status-active);
+  --sl-color-accent-high: #e9d5ff;
+
+  /* Neutral text ramp */
+  --sl-color-white: var(--locald-text-primary);
+  --sl-color-gray-1: var(--locald-text-primary);
+  --sl-color-gray-2: var(--locald-text-secondary);
+  --sl-color-gray-3: var(--locald-text-muted);
+  --sl-color-gray-4: var(--locald-border-strong);
+  --sl-color-gray-5: var(--locald-border-subtle);
+  --sl-color-gray-6: var(--locald-surface-2);
+  --sl-color-gray-7: var(--locald-surface-3);
+
+  /* Surfaces */
+  --sl-color-black: var(--locald-canvas);
+  --sl-color-bg: var(--locald-canvas);
+  --sl-color-bg-nav: var(--locald-surface-1);
+  --sl-color-bg-sidebar: var(--locald-surface-1);
+  --sl-color-bg-inline-code: var(--locald-surface-2);
+  --sl-color-bg-accent: var(--locald-status-active);
+
+  /* Hairlines */
+  --sl-color-hairline: var(--locald-border-subtle);
+  --sl-color-hairline-light: var(--locald-border-subtle);
+  --sl-color-hairline-shade: var(--locald-border-strong);
+
+  /* Text */
+  --sl-color-text: var(--locald-text-secondary);
+  --sl-color-text-accent: var(--locald-status-active);
+  --sl-color-text-invert: var(--locald-canvas);
+}
+
+/* Keep headings crisp and high-contrast (instrument-panel legibility). */
+:root {
+  --sl-color-white: var(--locald-text-primary);
+}

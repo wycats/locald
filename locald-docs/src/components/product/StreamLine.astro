@@ -1,0 +1,122 @@
+---
+/*
+ * StreamLine — one log/event line from the Stream.
+ *
+ * Anatomy (patterns poster panel 04): a header row of columns
+ * (TIMESTAMP · SOURCE · MESSAGE · STATUS · DURATION), then parsed log lines that
+ * preserve origin and time without burying the message. Source is color-coded;
+ * timestamp is quiet; message is primary; status/duration are structured fields.
+ *
+ * Render the header once with `header`, then one StreamLine per log line.
+ */
+type Status = "running" | "building" | "failed" | "active" | "idle" | "warning";
+
+interface Props {
+  /** Render the column header row instead of a data line. */
+  header?: boolean;
+  timestamp?: string;
+  /** Service source label, e.g. "api". */
+  source?: string;
+  message?: string;
+  /** HTTP-ish status code or short status token. */
+  status?: string;
+  /** Status semantic used to color the status field. */
+  statusKind?: Status;
+  duration?: string;
+  class?: string;
+}
+
+const {
+  header = false,
+  timestamp,
+  source,
+  message,
+  status,
+  statusKind = "running",
+  duration,
+  class: className,
+} = Astro.props;
+---
+
+{
+  header ? (
+    <div class:list={["locald-stream-line locald-stream-line--head", className]}>
+      <span class="locald-stream-line__ts">TIMESTAMP</span>
+      <span class="locald-stream-line__src">SOURCE</span>
+      <span class="locald-stream-line__msg">MESSAGE</span>
+      <span class="locald-stream-line__status">STATUS</span>
+      <span class="locald-stream-line__dur">DURATION</span>
+    </div>
+  ) : (
+    <div class:list={["locald-stream-line", className]}>
+      <span class="locald-stream-line__ts">{timestamp}</span>
+      <span class="locald-stream-line__src">{source}</span>
+      <span class="locald-stream-line__msg">{message}</span>
+      <span
+        class="locald-stream-line__status"
+        data-status={statusKind}
+      >
+        {status}
+      </span>
+      <span class="locald-stream-line__dur">{duration}</span>
+    </div>
+  )
+}
+
+<style>
+  .locald-stream-line {
+    display: grid;
+    grid-template-columns: 7rem 4rem 1fr 3rem 4rem;
+    gap: var(--locald-gap-md);
+    align-items: baseline;
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    padding: var(--locald-gap-sm) 0;
+  }
+
+  .locald-stream-line--head {
+    color: var(--locald-text-muted);
+    letter-spacing: 0.06em;
+    border-bottom: 1px solid var(--locald-border-subtle);
+    margin-bottom: var(--locald-gap-sm);
+  }
+
+  .locald-stream-line__ts {
+    color: var(--locald-text-muted);
+  }
+
+  .locald-stream-line__src {
+    color: var(--locald-status-building);
+  }
+
+  .locald-stream-line__msg {
+    color: var(--locald-text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .locald-stream-line__status[data-status="running"] {
+    color: var(--locald-status-running);
+  }
+  .locald-stream-line__status[data-status="failed"] {
+    color: var(--locald-status-failed);
+  }
+  .locald-stream-line__status[data-status="building"] {
+    color: var(--locald-status-building);
+  }
+  .locald-stream-line__status[data-status="active"] {
+    color: var(--locald-status-active);
+  }
+  .locald-stream-line__status[data-status="warning"] {
+    color: var(--locald-status-warning);
+  }
+  .locald-stream-line__status[data-status="idle"] {
+    color: var(--locald-text-muted);
+  }
+
+  .locald-stream-line__dur {
+    color: var(--locald-text-secondary);
+    text-align: right;
+  }
+</style>

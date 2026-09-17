@@ -1,0 +1,258 @@
+---
+title: Components & Interface Patterns
+description: The locald interface pattern reference — service rows, status chips, URL pills, and panels built from the shared design system.
+template: splash
+tableOfContents: false
+---
+
+import StyleGuidePage from "../../../components/styleguide/StyleGuidePage.astro";
+import SpecRow from "../../../components/styleguide/SpecRow.astro";
+import PrincipleCard from "../../../components/styleguide/PrincipleCard.astro";
+import StatusChip from "../../../components/product/StatusChip.astro";
+import UrlPill from "../../../components/product/UrlPill.astro";
+import ServiceRow from "../../../components/product/ServiceRow.astro";
+import StreamLine from "../../../components/product/StreamLine.astro";
+import DeckTile from "../../../components/product/DeckTile.astro";
+import SystemPlaneTile from "../../../components/product/SystemPlaneTile.astro";
+import CommandPaletteMock from "../../../components/product/CommandPaletteMock.astro";
+
+<StyleGuidePage
+  title="Components & Interface Patterns"
+  subtitle="locald visual style guide"
+  version="v0.1"
+  lede="Reusable building blocks of the locald interface."
+  page="05"
+>
+
+<div class="locald-poster">
+<div class="locald-poster__main">
+
+<SpecRow
+  number="01"
+  title="Service Row"
+  description="A compact line representing a running or available service. Name · Type hint · Status · URL · Quick actions."
+>
+  <div class="locald-stack">
+    <ServiceRow name="api" kind="api" status="running" url="api.localhost" />
+    <ServiceRow name="web" kind="web" status="building" url="web.localhost" />
+    <ServiceRow name="worker" kind="worker" status="idle" />
+    <ServiceRow name="postgres" kind="db" status="failed" />
+  </div>
+</SpecRow>
+
+<SpecRow
+  number="02"
+  title="Status Chips / Health States"
+  description="Consistent vocabulary for state across UI."
+>
+  <div class="locald-chip-row">
+    <StatusChip status="running" />
+    <StatusChip status="building" />
+    <StatusChip status="failed" />
+    <StatusChip status="active" />
+    <StatusChip status="idle" />
+  </div>
+</SpecRow>
+
+<SpecRow
+  number="03"
+  title="Local URL Affordances"
+  description="HTTPS-first local domains. No ports, human readable."
+>
+  <div class="locald-pill-row">
+    <UrlPill href="web.localhost" status="running" static />
+    <UrlPill href="api.localhost" status="running" static />
+    <UrlPill href="worker.localhost" status="building" static />
+  </div>
+</SpecRow>
+
+<SpecRow
+  number="04"
+  title="Log Stream Line Anatomy"
+  description="One log event, broken into semantic parts."
+>
+  <StreamLine
+    timestamp="10:15:23.124"
+    source="api"
+    message="GET /v1/users 200 OK"
+    code="200"
+    codeStatus="running"
+    duration="22ms"
+    header
+  />
+</SpecRow>
+
+<SpecRow
+  number="05"
+  title="Deck Tile"
+  description="A focused live service panel in the deck."
+>
+  <DeckTile
+    name="api"
+    typeHint="HTTP API"
+    status="running"
+    url="api.localhost"
+    instances="12 instances"
+    gitRef="main a1b2c3d"
+  />
+</SpecRow>
+
+<SpecRow
+  number="06"
+  title="System Plane Tile"
+  description="The virtual service that represents locald itself."
+>
+  <SystemPlaneTile
+    name="system.localhost"
+    role="Platform Control Plane"
+    capabilities="DNS · TLS · Auth · Routing"
+    uptime="7d 14h"
+    events="246"
+    health="HEALTHY"
+  />
+</SpecRow>
+
+<SpecRow
+  number="07"
+  title="Command Palette"
+  description="Quick actions for the current selection. Global shortcut: ⌘K."
+>
+  <CommandPaletteMock />
+</SpecRow>
+
+<SpecRow
+  number="08"
+  title="Panel & Spacing Tokens"
+  description="Surface hierarchy, radius scale, and spacing rhythm."
+>
+  <div class="locald-token-grid">
+    <div class="locald-token">
+      <span
+        class="locald-swatch"
+        style="background:var(--locald-canvas)"
+      ></span>
+      canvas
+    </div>
+    <div class="locald-token">
+      <span
+        class="locald-swatch"
+        style="background:var(--locald-surface-1)"
+      ></span>
+      surface-1
+    </div>
+    <div class="locald-token">
+      <span
+        class="locald-swatch"
+        style="background:var(--locald-surface-2)"
+      ></span>
+      surface-2
+    </div>
+    <div class="locald-token">
+      <span
+        class="locald-swatch"
+        style="background:var(--locald-surface-3)"
+      ></span>
+      surface-3
+    </div>
+    <div class="locald-token">
+      <span
+        class="locald-swatch"
+        style="background:var(--locald-border-strong)"
+      ></span>
+      border
+    </div>
+  </div>
+</SpecRow>
+
+</div>
+
+<aside class="locald-poster__side">
+
+<div class="locald-side-group">
+  <p class="locald-side-group__title">Interaction Principles</p>
+  <PrincipleCard
+    icon="grid"
+    title="Stable Layout"
+    description="Keep structure steady. Reduce movement, avoid surprise."
+  />
+  <PrincipleCard
+    icon="eye"
+    title="Reveal by Intent"
+    description="Show the 'what' first. Reveal the 'how' on demand."
+  />
+  <PrincipleCard
+    icon="dots"
+    title="Color Means State"
+    description="Use color to communicate state, not category."
+  />
+  <PrincipleCard
+    icon="globe"
+    title="Domains over Ports"
+    description="Local domains are easier to read, share, and trust."
+  />
+  <PrincipleCard
+    icon="clock"
+    title="Preserve the Story"
+    description="After the spinner, keep context, state, and focus."
+  />
+</div>
+
+<div class="locald-side-group">
+  <p class="locald-side-group__title">Status Color Tokens</p>
+  <div class="locald-legend">
+    <span class="locald-legend__item">
+      <span
+        class="locald-legend__dot"
+        style="background:var(--locald-status-running)"
+      ></span>
+      Running
+    </span>
+    <span class="locald-legend__item">
+      <span
+        class="locald-legend__dot"
+        style="background:var(--locald-status-building)"
+      ></span>
+      Building
+    </span>
+    <span class="locald-legend__item">
+      <span
+        class="locald-legend__dot"
+        style="background:var(--locald-status-failed)"
+      ></span>
+      Failed
+    </span>
+    <span class="locald-legend__item">
+      <span
+        class="locald-legend__dot"
+        style="background:var(--locald-status-active)"
+      ></span>
+      Active
+    </span>
+    <span class="locald-legend__item">
+      <span
+        class="locald-legend__dot"
+        style="background:var(--locald-status-network)"
+      ></span>
+      Network
+    </span>
+    <span class="locald-legend__item">
+      <span
+        class="locald-legend__dot"
+        style="background:var(--locald-status-idle)"
+      ></span>
+      Idle
+    </span>
+    <span class="locald-legend__item">
+      <span
+        class="locald-legend__dot"
+        style="background:var(--locald-status-warning)"
+      ></span>
+      Warning
+    </span>
+  </div>
+</div>
+
+</aside>
+</div>
+
+</StyleGuidePage>

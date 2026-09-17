@@ -1,0 +1,82 @@
+---
+/*
+ * StatusChip — a small pill that names a state.
+ *
+ * Anatomy (patterns poster panel 02): rounded-rect outline, leading status dot,
+ * uppercase label. Color comes from the Foundations-poster status tokens; color
+ * always pairs with text (never color alone) for accessibility.
+ *
+ * Status vocabulary matches the product props contract:
+ *   running | building | failed | active | idle | warning
+ */
+interface Props {
+  status: "running" | "building" | "failed" | "active" | "idle" | "warning";
+  /** Override the label text; defaults to the uppercased status. */
+  label?: string;
+  class?: string;
+}
+
+const { status, label, class: className } = Astro.props;
+
+const DEFAULT_LABELS: Record<Props["status"], string> = {
+  running: "RUNNING",
+  building: "BUILDING",
+  failed: "FAILED",
+  active: "ACTIVE",
+  idle: "IDLE",
+  warning: "WARNING",
+};
+
+const text = label ?? DEFAULT_LABELS[status];
+---
+
+<span class:list={["locald-status-chip", className]} data-status={status}>
+  <span class="locald-status-chip__dot" aria-hidden="true"></span>
+  <span class="locald-status-chip__label">{text}</span>
+</span>
+
+<style>
+  .locald-status-chip {
+    --chip-color: var(--locald-status-idle);
+    display: inline-flex;
+    align-items: center;
+    gap: var(--locald-gap-xs);
+    padding: 0.125rem 0.5rem;
+    border: 1px solid color-mix(in srgb, var(--chip-color) 45%, transparent);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--chip-color) 10%, transparent);
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    line-height: var(--locald-type-caption-line);
+    letter-spacing: 0.06em;
+    color: var(--chip-color);
+    white-space: nowrap;
+  }
+
+  .locald-status-chip[data-status="running"] {
+    --chip-color: var(--locald-status-running);
+  }
+  .locald-status-chip[data-status="building"] {
+    --chip-color: var(--locald-status-building);
+  }
+  .locald-status-chip[data-status="failed"] {
+    --chip-color: var(--locald-status-failed);
+  }
+  .locald-status-chip[data-status="active"] {
+    --chip-color: var(--locald-status-active);
+  }
+  .locald-status-chip[data-status="idle"] {
+    --chip-color: var(--locald-status-idle);
+  }
+  .locald-status-chip[data-status="warning"] {
+    --chip-color: var(--locald-status-warning);
+  }
+
+  .locald-status-chip__dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--chip-color);
+    flex: none;
+  }
+</style>

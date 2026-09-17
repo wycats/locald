@@ -1,0 +1,72 @@
+---
+/*
+ * ColorSwatch — a single color chip with name + hex, from the Color System
+ * panel of the Brand Foundations poster.
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-2-foundations.png (panel 01 COLOR
+ * SYSTEM). A rounded color block sits above a two-line caption: the role name
+ * and the hex value in mono.
+ */
+
+interface Props {
+  /** Role name, e.g. "Canvas" / "Running". */
+  name: string;
+  /** Hex value, e.g. "#0B0F14". */
+  hex: string;
+  class?: string;
+}
+
+const { name, hex, class: className } = Astro.props;
+---
+
+<figure class:list={["locald-swatch-card", className]}>
+  <span
+    class="locald-swatch-card__chip"
+    style={`background:${hex}`}
+    aria-hidden="true"></span>
+  <figcaption class="locald-swatch-card__caption">
+    <span class="locald-swatch-card__name">{name}</span>
+    <span class="locald-swatch-card__hex">{hex}</span>
+  </figcaption>
+</figure>
+
+<style>
+  .locald-swatch-card {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-sm);
+    min-width: 0;
+  }
+
+  .locald-swatch-card__chip {
+    display: block;
+    width: 100%;
+    height: 3.5rem;
+    border-radius: var(--locald-radius-md);
+    border: 1px solid var(--locald-border-subtle);
+  }
+
+  .locald-swatch-card__caption {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-family: var(--locald-font-mono);
+    min-width: 0;
+  }
+
+  .locald-swatch-card__name {
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .locald-swatch-card__hex {
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-muted);
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+</style>

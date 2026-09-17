@@ -1,0 +1,198 @@
+---
+/*
+ * StreamPanel — the Stream mockup from the Product Surface Grammar poster
+ * (page 03, top band, center). A terminal-style log viewer: a header
+ * ("STREAM (logs)" + a window range like "1m"), a body of timestamped log
+ * lines with a color-coded source token and a status/duration tail, and a
+ * `> _` prompt at the bottom.
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-3-grammar.png.
+ */
+
+interface LogLine {
+  ts: string;
+  source: string;
+  message: string;
+  status: string;
+  /** Color the status token: ok/2xx -> running, else muted. */
+  ok?: boolean;
+  duration: string;
+}
+
+interface Props {
+  title?: string;
+  range?: string;
+  logs?: LogLine[];
+  class?: string;
+}
+
+const {
+  title = "STREAM (logs)",
+  range = "1m",
+  logs = [
+    { ts: "10:15:23", source: "web", message: "GET /", status: "200", ok: true, duration: "12ms" },
+    { ts: "10:15:23", source: "api", message: "POST /v1/users", status: "201", ok: true, duration: "38ms" },
+    { ts: "10:15:24", source: "worker", message: "job_42", status: "ok", ok: true, duration: "21ms" },
+    { ts: "10:15:24", source: "db", message: "SELECT *", status: "", duration: "5ms" },
+    { ts: "10:15:25", source: "web", message: "GET /v1/me", status: "200", ok: true, duration: "22ms" },
+    { ts: "10:15:25", source: "web", message: "GET /assets/app.js", status: "200", ok: true, duration: "46ms" },
+    { ts: "10:15:26", source: "api", message: "GET /v1/users", status: "200", ok: true, duration: "17ms" },
+  ],
+  class: className,
+} = Astro.props;
+---
+
+<section class:list={["locald-streampanel", className]} aria-label={title}>
+  <header class="locald-streampanel__head">
+    <span class="locald-streampanel__dot" aria-hidden="true"></span>
+    <span class="locald-streampanel__title">{title}</span>
+    <span class="locald-streampanel__range">{range}</span>
+  </header>
+
+  <div class="locald-streampanel__body">
+    {
+      logs.map((l) => (
+        <div class="locald-streampanel__line">
+          <span class="locald-streampanel__ts">{l.ts}</span>
+          <span class="locald-streampanel__src" data-src={l.source}>
+            {l.source}
+          </span>
+          <span class="locald-streampanel__msg">{l.message}</span>
+          <span class="locald-streampanel__tail">
+            <span
+              class:list={[
+                "locald-streampanel__status",
+                l.ok && "locald-streampanel__status--ok",
+              ]}
+            >
+              {l.status}
+            </span>
+            <span class="locald-streampanel__dur">{l.duration}</span>
+          </span>
+        </div>
+      ))
+    }
+  </div>
+
+  <div class="locald-streampanel__prompt">&gt; <span class="locald-streampanel__cursor"></span></div>
+</section>
+
+<style>
+  .locald-streampanel {
+    border: 1px solid var(--locald-border-strong);
+    border-radius: var(--locald-radius-md);
+    background: var(--locald-surface-2);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .locald-streampanel__head {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    padding: var(--locald-gap-md) var(--locald-space-2);
+    border-bottom: 1px solid var(--locald-border-subtle);
+  }
+
+  .locald-streampanel__dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--locald-status-running);
+    flex: none;
+  }
+
+  .locald-streampanel__title {
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    letter-spacing: 0.06em;
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-streampanel__range {
+    margin-left: auto;
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-muted);
+  }
+
+  .locald-streampanel__body {
+    padding: var(--locald-gap-md) var(--locald-space-2);
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-xs);
+  }
+
+  .locald-streampanel__line {
+    display: grid;
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+    gap: var(--locald-gap-sm);
+    align-items: baseline;
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+  }
+
+  .locald-streampanel__ts {
+    color: var(--locald-text-muted);
+  }
+
+  .locald-streampanel__src {
+    color: var(--locald-status-running);
+  }
+  .locald-streampanel__src[data-src="api"] {
+    color: var(--locald-status-building);
+  }
+  .locald-streampanel__src[data-src="worker"] {
+    color: var(--locald-status-active);
+  }
+  .locald-streampanel__src[data-src="db"] {
+    color: var(--locald-status-network);
+  }
+
+  .locald-streampanel__msg {
+    color: var(--locald-text-secondary);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .locald-streampanel__tail {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--locald-gap-sm);
+    justify-content: flex-end;
+    white-space: nowrap;
+  }
+
+  .locald-streampanel__status {
+    color: var(--locald-text-muted);
+  }
+
+  .locald-streampanel__status--ok {
+    color: var(--locald-status-running);
+  }
+
+  .locald-streampanel__dur {
+    color: var(--locald-text-muted);
+  }
+
+  .locald-streampanel__prompt {
+    padding: var(--locald-gap-md) var(--locald-space-2);
+    border-top: 1px solid var(--locald-border-subtle);
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 0.35em;
+  }
+
+  .locald-streampanel__cursor {
+    display: inline-block;
+    width: 0.5em;
+    height: 1em;
+    background: var(--locald-status-running);
+  }
+</style>

@@ -1,0 +1,163 @@
+---
+/*
+ * SystemPlaneTile — locald itself rendered as an observable virtual service.
+ *
+ * Anatomy (patterns poster panel 06): same conceptual object as a DeckTile, but
+ * marked distinct by the amber/network accent on the title ("SYSTEM PLANE"),
+ * with platform meta (name, role, capabilities) and platform metrics
+ * (uptime, events, health).
+ *
+ * Making the platform observable with the same model as user services is a core
+ * part of the product's credibility — so this reuses the tile grammar, it does
+ * not invent a separate dashboard mode.
+ */
+
+interface Metric {
+  label: string;
+  value: string;
+  /** Render the value in the healthy (running) color. */
+  healthy?: boolean;
+}
+
+interface Props {
+  name?: string;
+  role?: string;
+  capabilities?: string;
+  metrics?: Metric[];
+  class?: string;
+}
+
+const {
+  name = "system.localhost",
+  role = "Platform Control Plane",
+  capabilities = "DNS · TLS · Auth · Routing",
+  metrics = [],
+  class: className,
+} = Astro.props;
+---
+
+<div class:list={["locald-system-plane", className]}>
+  <header class="locald-system-plane__header">
+    <span class="locald-system-plane__title">SYSTEM PLANE</span>
+    <svg class="locald-system-plane__spark" width="56" height="16" viewBox="0 0 56 16" fill="none" aria-hidden="true">
+      <path d="M1 8 L9 8 L13 3 L17 13 L21 8 L33 8 L37 5 L41 11 L45 8 L55 8" stroke="var(--locald-plane-system)" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"></path>
+    </svg>
+  </header>
+
+  <div class="locald-system-plane__body">
+    <dl class="locald-system-plane__meta">
+      <div class="locald-system-plane__meta-row">
+        <span class="locald-system-plane__meta-icon" aria-hidden="true">🔒</span>
+        <span class="locald-system-plane__name">{name}</span>
+      </div>
+      <div class="locald-system-plane__meta-row">
+        <span class="locald-system-plane__meta-icon" aria-hidden="true">◈</span>
+        <span>{role}</span>
+      </div>
+      <div class="locald-system-plane__meta-row">
+        <span class="locald-system-plane__meta-icon" aria-hidden="true">≣</span>
+        <span>{capabilities}</span>
+      </div>
+    </dl>
+
+    {
+      metrics.length > 0 && (
+        <dl class="locald-system-plane__metrics">
+          {metrics.map((m) => (
+            <div class="locald-system-plane__metric">
+              <dt>{m.label}</dt>
+              <dd class:list={[m.healthy && "locald-system-plane__metric--healthy"]}>
+                {m.value}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      )
+    }
+  </div>
+</div>
+
+<style>
+  .locald-system-plane {
+    border: 1px solid var(--locald-plane-system);
+    border-radius: var(--locald-radius-md);
+    background: var(--locald-surface-1);
+    overflow: hidden;
+    font-family: var(--locald-font-sans);
+  }
+
+  .locald-system-plane__header {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    padding: var(--locald-gap-md) var(--locald-gap-lg);
+    border-bottom: 1px solid var(--locald-border-subtle);
+  }
+
+  .locald-system-plane__title {
+    font-family: var(--locald-font-mono);
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--locald-plane-system);
+  }
+
+  .locald-system-plane__spark {
+    margin-left: auto;
+  }
+
+  .locald-system-plane__body {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--locald-space-2);
+    padding: var(--locald-gap-lg);
+  }
+
+  .locald-system-plane__meta,
+  .locald-system-plane__metrics {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-md);
+  }
+
+  .locald-system-plane__meta-row {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-system-plane__meta-icon {
+    color: var(--locald-text-muted);
+  }
+
+  .locald-system-plane__name {
+    color: var(--locald-text-primary);
+  }
+
+  .locald-system-plane__metric {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+  }
+
+  .locald-system-plane__metric dt {
+    color: var(--locald-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .locald-system-plane__metric dd {
+    margin: 0;
+    color: var(--locald-text-primary);
+  }
+
+  .locald-system-plane__metric--healthy {
+    color: var(--locald-status-running);
+  }
+</style>

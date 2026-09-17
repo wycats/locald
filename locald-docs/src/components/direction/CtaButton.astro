@@ -1,0 +1,73 @@
+---
+/*
+ * CtaButton — a call-to-action button from the Public Site Direction poster
+ * (page 04, bottom-right). Three variants:
+ *   - primary:  lime-outlined with a `>_` sigil ("Get Started").
+ *   - secondary: neutral outline ("Read the Concepts").
+ *   - plane:    purple-outline, full-width ("Open the Dashboard Model").
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-4-direction.png. These are inert
+ * style-guide specimens; href is optional.
+ */
+
+type Variant = "primary" | "secondary" | "plane";
+
+interface Props {
+  variant?: Variant;
+  label: string;
+  href?: string;
+  /** Show the `>_` prompt sigil before the label (primary). */
+  sigil?: boolean;
+  class?: string;
+}
+
+const { variant = "secondary", label, href, sigil = false, class: className } =
+  Astro.props;
+const Tag = href ? "a" : "span";
+---
+
+<Tag
+  class:list={[
+    "locald-cta",
+    `locald-cta--${variant}`,
+    className,
+  ]}
+  href={href}
+  role={href ? undefined : "button"}
+>
+  {sigil && <span class="locald-cta__sigil" aria-hidden="true">&gt;_</span>}
+  <span class="locald-cta__label">{label}</span>
+</Tag>
+
+<style>
+  .locald-cta {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--locald-gap-sm);
+    padding: var(--locald-gap-md) var(--locald-space-2);
+    border: 1px solid var(--locald-border-strong);
+    border-radius: var(--locald-radius-md);
+    background: transparent;
+    font-family: var(--locald-font-mono);
+    font-size: 0.85rem;
+    color: var(--locald-text-primary);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+
+  .locald-cta--primary {
+    border-color: var(--locald-status-running);
+    color: var(--locald-status-running);
+  }
+
+  .locald-cta--plane {
+    border-color: var(--locald-status-active);
+    color: var(--locald-status-active);
+    width: 100%;
+  }
+
+  .locald-cta__sigil {
+    font-weight: 700;
+  }
+</style>

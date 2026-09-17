@@ -1,0 +1,63 @@
+---
+/*
+ * LocaldMark — the `[ld` monogram with a lime route dot.
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-2-foundations.png (panel 03) and
+ * the cover poster guide.png. The mark is a lowercase bracket-monogram where
+ * the dot is the meaningful element ("The Dot Route" direction). Product-first,
+ * never a mascot.
+ */
+interface Props {
+  /** Pixel size of the mark height. */
+  size?: number;
+  class?: string;
+  /** Accessible label; omit to render decorative (aria-hidden). */
+  label?: string;
+}
+
+const { size = 28, class: className, label } = Astro.props;
+const decorative = !label;
+---
+
+<span
+  class:list={["locald-mark", className]}
+  style={`--locald-mark-size:${size}px`}
+  role={decorative ? undefined : "img"}
+  aria-label={decorative ? undefined : label}
+  aria-hidden={decorative ? "true" : undefined}
+>
+  <span class="locald-mark__bracket">[</span><span class="locald-mark__letters"
+    >ld</span
+  ><span class="locald-mark__dot"></span>
+</span>
+
+<style>
+  .locald-mark {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.05em;
+    font-family: var(--locald-font-mono);
+    font-weight: 700;
+    font-size: var(--locald-mark-size, 28px);
+    line-height: 1;
+    color: var(--locald-text-primary);
+    user-select: none;
+  }
+
+  .locald-mark__bracket {
+    color: var(--locald-status-running);
+  }
+
+  .locald-mark__letters {
+    letter-spacing: -0.02em;
+  }
+
+  .locald-mark__dot {
+    align-self: center;
+    width: 0.22em;
+    height: 0.22em;
+    margin-left: 0.12em;
+    border-radius: 50%;
+    background: var(--locald-status-running);
+  }
+</style>

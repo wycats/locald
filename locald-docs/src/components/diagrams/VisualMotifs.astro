@@ -1,0 +1,290 @@
+---
+/*
+ * VisualMotifs — the five recurring visual motifs from the Brand Foundations
+ * poster (panel 04 VISUAL MOTIFS).
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-2-foundations.png (panel 04). Each
+ * motif is a small line illustration over a labeled cell:
+ *   - Routes:          crossing dashed/solid paths with route dots, one lime.
+ *   - Panes:           a sidebar + stacked panes (one lime-outlined).
+ *   - Service Topology: a hexagon hub with six satellite nodes.
+ *   - Prompt / Action: `$`, `>` prompt lines and a dashed `>_` input box.
+ *   - Local URLs:      a stack of URL pills with trailing status dots.
+ *
+ * Domains use *.localhost (written-guide rule), not the poster's .local.
+ */
+
+interface Props {
+  class?: string;
+}
+
+const { class: className } = Astro.props;
+
+const urls = [
+  { host: "web.localhost", scheme: "http", dot: "var(--locald-status-running)" },
+  { host: "api.localhost", scheme: "http", dot: "var(--locald-status-running)" },
+  { host: "stream.localhost", scheme: "ws", dot: "var(--locald-status-active)" },
+  { host: "auth.localhost", scheme: "https", dot: "var(--locald-status-running)" },
+];
+---
+
+<div class:list={["locald-motifs", className]}>
+  <!-- Routes -->
+  <figure class="locald-motif">
+    <div class="locald-motif__art">
+      <svg viewBox="0 0 120 80" role="img" aria-label="Crossing routes">
+        <g
+          fill="none"
+          stroke="var(--locald-border-strong)"
+          stroke-width="1.5"
+          stroke-dasharray="3 3"
+        >
+          <path d="M10 18 C 50 18, 70 62, 110 62" />
+          <path d="M10 62 C 50 62, 70 18, 110 18" />
+        </g>
+        <path
+          d="M10 40 C 50 40, 70 32, 110 32"
+          fill="none"
+          stroke="var(--locald-status-running)"
+          stroke-width="1.75"
+        />
+        <g fill="var(--locald-surface-1)" stroke="var(--locald-border-strong)">
+          <circle cx="10" cy="18" r="3.5" />
+          <circle cx="10" cy="62" r="3.5" />
+          <circle cx="110" cy="18" r="3.5" />
+          <circle cx="110" cy="62" r="3.5" />
+        </g>
+        <circle cx="10" cy="40" r="3.5" fill="var(--locald-status-running)" />
+        <circle cx="110" cy="32" r="3.5" fill="var(--locald-status-running)" />
+      </svg>
+    </div>
+    <figcaption class="locald-motif__label">Routes</figcaption>
+  </figure>
+
+  <!-- Panes -->
+  <figure class="locald-motif">
+    <div class="locald-motif__art">
+      <svg viewBox="0 0 120 80" role="img" aria-label="Sidebar and panes">
+        <g fill="none" stroke="var(--locald-border-strong)" stroke-width="1.5">
+          <rect x="8" y="10" width="26" height="60" rx="3" />
+          <rect x="42" y="10" width="70" height="26" rx="3" />
+        </g>
+        <g stroke="var(--locald-border-strong)" stroke-width="1.5">
+          <line x1="13" y1="20" x2="29" y2="20" />
+          <line x1="13" y1="28" x2="29" y2="28" />
+          <line x1="13" y1="36" x2="29" y2="36" />
+        </g>
+        <rect
+          x="42"
+          y="42"
+          width="70"
+          height="28"
+          rx="3"
+          fill="none"
+          stroke="var(--locald-status-running)"
+          stroke-width="1.75"
+        />
+      </svg>
+    </div>
+    <figcaption class="locald-motif__label">Panes</figcaption>
+  </figure>
+
+  <!-- Service Topology -->
+  <figure class="locald-motif">
+    <div class="locald-motif__art">
+      <svg viewBox="0 0 120 80" role="img" aria-label="Service topology">
+        <g fill="none" stroke="var(--locald-border-strong)" stroke-width="1.25" stroke-dasharray="3 3">
+          <line x1="60" y1="40" x2="24" y2="20" />
+          <line x1="60" y1="40" x2="96" y2="20" />
+          <line x1="60" y1="40" x2="18" y2="40" />
+          <line x1="60" y1="40" x2="102" y2="40" />
+          <line x1="60" y1="40" x2="24" y2="60" />
+          <line x1="60" y1="40" x2="96" y2="60" />
+        </g>
+        <polygon
+          points="60,28 70,34 70,46 60,52 50,46 50,34"
+          fill="none"
+          stroke="var(--locald-stroke-route)"
+          stroke-width="1.5"
+        />
+        <g fill="none" stroke="var(--locald-border-strong)" stroke-width="1.5">
+          <rect x="18" y="14" width="12" height="12" rx="2" />
+          <rect x="90" y="14" width="12" height="12" rx="2" />
+          <rect x="10" y="34" width="12" height="12" rx="2" />
+          <rect x="98" y="34" width="12" height="12" rx="2" />
+          <rect x="18" y="54" width="12" height="12" rx="2" />
+          <rect x="90" y="54" width="12" height="12" rx="2" />
+        </g>
+      </svg>
+    </div>
+    <figcaption class="locald-motif__label">Service Topology</figcaption>
+  </figure>
+
+  <!-- Prompt / Action -->
+  <figure class="locald-motif">
+    <div class="locald-motif__art locald-motif__art--prompt">
+      <span class="locald-motif__prompt-row">
+        <span class="locald-motif__sigil locald-motif__sigil--dollar">$</span>
+        <span class="locald-motif__cursor"></span>
+        <span class="locald-motif__rule"></span>
+      </span>
+      <span class="locald-motif__prompt-row">
+        <span class="locald-motif__sigil">&gt;</span>
+        <span class="locald-motif__rule"></span>
+      </span>
+      <span class="locald-motif__input">&gt;_</span>
+    </div>
+    <figcaption class="locald-motif__label">Prompt / Action</figcaption>
+  </figure>
+
+  <!-- Local URLs -->
+  <figure class="locald-motif">
+    <div class="locald-motif__art locald-motif__art--urls">
+      {
+        urls.map((u) => (
+          <span class="locald-motif__url">
+            <span class="locald-motif__url-text">
+              {u.scheme}://{u.host}
+            </span>
+            <span
+              class="locald-motif__url-dot"
+              style={`background:${u.dot}`}
+            />
+          </span>
+        ))
+      }
+    </div>
+    <figcaption class="locald-motif__label">Local URLs</figcaption>
+  </figure>
+</div>
+
+<style>
+  .locald-motifs {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: var(--locald-space-3);
+  }
+
+  .locald-motif {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-md);
+    min-width: 0;
+  }
+
+  .locald-motif__art {
+    height: 6rem;
+    display: grid;
+    place-items: center;
+  }
+
+  .locald-motif__art svg {
+    width: 100%;
+    height: 100%;
+  }
+
+  .locald-motif__label {
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--locald-text-muted);
+  }
+
+  /* Prompt / Action */
+  .locald-motif__art--prompt {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: stretch;
+    gap: var(--locald-gap-md);
+    padding: 0 var(--locald-gap-sm);
+  }
+
+  .locald-motif__prompt-row {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+  }
+
+  .locald-motif__sigil {
+    font-family: var(--locald-font-mono);
+    font-size: 1rem;
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-motif__sigil--dollar {
+    color: var(--locald-status-running);
+  }
+
+  .locald-motif__cursor {
+    width: 0.55rem;
+    height: 1rem;
+    background: var(--locald-status-running);
+    flex: none;
+  }
+
+  .locald-motif__rule {
+    flex: 1;
+    height: 1.5px;
+    background: var(--locald-status-running);
+  }
+
+  .locald-motif__input {
+    margin-top: 2px;
+    border: 1.5px dashed var(--locald-border-strong);
+    border-radius: var(--locald-radius-sm);
+    padding: var(--locald-gap-sm) var(--locald-gap-md);
+    font-family: var(--locald-font-mono);
+    font-size: 0.85rem;
+    color: var(--locald-text-secondary);
+  }
+
+  /* Local URLs */
+  .locald-motif__art--urls {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: var(--locald-gap-sm);
+  }
+
+  .locald-motif__url {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    border: 1px solid var(--locald-border-strong);
+    border-radius: var(--locald-radius-sm);
+    background: var(--locald-surface-2);
+    padding: 3px var(--locald-gap-sm);
+  }
+
+  .locald-motif__url-text {
+    flex: 1;
+    font-family: var(--locald-font-mono);
+    font-size: 0.6rem;
+    color: var(--locald-text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .locald-motif__url-dot {
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    flex: none;
+  }
+
+  @media (max-width: 60rem) {
+    .locald-motifs {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  @media (max-width: 36rem) {
+    .locald-motifs {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

@@ -1,0 +1,85 @@
+---
+/*
+ * SpecPanel — the bordered container that wraps every component demo and
+ * product surface in the style guide.
+ *
+ * Anatomy (patterns poster, every numbered panel): subtle border, surface-1
+ * fill, modest radius, comfortable interior padding, optional label/caption.
+ *
+ * This is the base panel primitive; product primitives (ServiceRow, DeckTile,
+ * SystemPlaneTile) and style-guide demos compose it.
+ */
+interface Props {
+  /** Optional small label rendered above the panel body. */
+  label?: string;
+  /** Optional caption rendered below the panel body. */
+  caption?: string;
+  /** Surface level. Default is surface-1. */
+  surface?: "1" | "2" | "3";
+  /** Padding density. Default is comfortable. */
+  density?: "comfortable" | "compact";
+  /** Optional extra class names. */
+  class?: string;
+}
+
+const {
+  label,
+  caption,
+  surface = "1",
+  density = "comfortable",
+  class: className,
+} = Astro.props;
+---
+
+<div class:list={["locald-spec-panel", className]} data-density={density}>
+  {label && <p class="locald-spec-panel__label">{label}</p>}
+  <div class="locald-spec-panel__body" data-surface={surface}>
+    <slot />
+  </div>
+  {caption && <p class="locald-spec-panel__caption">{caption}</p>}
+</div>
+
+<style>
+  .locald-spec-panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-sm);
+  }
+
+  .locald-spec-panel__label {
+    margin: 0;
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    line-height: var(--locald-type-caption-line);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--locald-text-muted);
+  }
+
+  .locald-spec-panel__body {
+    border: 1px solid var(--locald-border-subtle);
+    border-radius: var(--locald-radius-lg);
+    background: var(--locald-surface-1);
+    padding: var(--locald-space-3);
+    box-shadow: var(--locald-shadow-panel);
+  }
+
+  .locald-spec-panel__body[data-surface="2"] {
+    background: var(--locald-surface-2);
+  }
+
+  .locald-spec-panel__body[data-surface="3"] {
+    background: var(--locald-surface-3);
+  }
+
+  .locald-spec-panel[data-density="compact"] .locald-spec-panel__body {
+    padding: var(--locald-space-2);
+  }
+
+  .locald-spec-panel__caption {
+    margin: 0;
+    font-size: var(--locald-type-caption-size);
+    line-height: var(--locald-type-caption-line);
+    color: var(--locald-text-muted);
+  }
+</style>

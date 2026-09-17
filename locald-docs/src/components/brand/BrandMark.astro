@@ -1,0 +1,120 @@
+---
+/*
+ * BrandMark — the locald brand-mark lockups.
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-2-foundations.png (panel 03 BRAND
+ * MARK). Three variants:
+ *   - monogram:    the `[ld` bracket-monogram (built on LocaldMark).
+ *   - wordmark:    the lowercase `locald` wordmark in the brand sans.
+ *   - combination: monogram + wordmark, horizontal.
+ *
+ * Each lockup carries a two-line caption (name + usage) under a hairline, as
+ * shown on the poster.
+ */
+import LocaldMark from "./LocaldMark.astro";
+
+type Variant = "monogram" | "wordmark" | "combination";
+
+interface Props {
+  variant: Variant;
+  /** Primary caption, e.g. "Monogram". */
+  label: string;
+  /** Usage caption, e.g. "Primary" / "Horizontal". */
+  usage?: string;
+  class?: string;
+}
+
+const { variant, label, usage, class: className } = Astro.props;
+---
+
+<figure class:list={["locald-brandmark", className]}>
+  <div class="locald-brandmark__art">
+    {variant === "monogram" && <LocaldMark size={56} label="locald monogram" />}
+
+    {
+      variant === "wordmark" && (
+        <span class="locald-brandmark__wordmark" aria-label="locald wordmark">
+          locald
+        </span>
+      )
+    }
+
+    {
+      variant === "combination" && (
+        <span
+          class="locald-brandmark__combo"
+          role="img"
+          aria-label="locald combination mark"
+        >
+          <LocaldMark size={40} />
+          <span class="locald-brandmark__wordmark" aria-hidden="true">
+            locald
+          </span>
+        </span>
+      )
+    }
+  </div>
+
+  <figcaption class="locald-brandmark__caption">
+    <span class="locald-brandmark__name">{label}</span>
+    {usage && <span class="locald-brandmark__usage">{usage}</span>}
+  </figcaption>
+</figure>
+
+<style>
+  .locald-brandmark {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--locald-space-2);
+    text-align: center;
+  }
+
+  .locald-brandmark__art {
+    flex: 1;
+    display: grid;
+    place-items: center;
+    min-height: 5rem;
+    width: 100%;
+  }
+
+  .locald-brandmark__wordmark {
+    font-family: var(--locald-font-sans);
+    font-weight: 700;
+    font-size: 2.75rem;
+    line-height: 1;
+    letter-spacing: -0.03em;
+    color: var(--locald-text-primary);
+  }
+
+  .locald-brandmark__combo {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--locald-gap-md);
+  }
+
+  .locald-brandmark__combo .locald-brandmark__wordmark {
+    font-size: 2.25rem;
+  }
+
+  .locald-brandmark__caption {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding-top: var(--locald-space-1);
+    border-top: 1px solid var(--locald-border-subtle);
+    width: 100%;
+    font-family: var(--locald-font-mono);
+  }
+
+  .locald-brandmark__name {
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-brandmark__usage {
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-muted);
+  }
+</style>

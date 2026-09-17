@@ -1,0 +1,135 @@
+---
+/*
+ * StorySteps — the "THE STORY OF YOUR PLATFORM" numbered list from the Public
+ * Site Direction poster (page 04, left column). Three steps (01 Rack, 02
+ * Stream, 03 Deck), each a ringed number, a noun glyph, a title, and a short
+ * description. A dashed vertical line connects the rings.
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-4-direction.png.
+ */
+import PrincipleCard from "../styleguide/PrincipleCard.astro";
+
+interface Step {
+  num: string;
+  icon: "rack" | "stream" | "deck";
+  title: string;
+  description: string;
+  /** Ring accent color role. */
+  accent: "running" | "building" | "active";
+}
+
+interface Props {
+  steps?: Step[];
+  class?: string;
+}
+
+const {
+  steps = [
+    {
+      num: "01",
+      icon: "rack",
+      title: "Rack",
+      description: "Run and route your services.",
+      accent: "running",
+    },
+    {
+      num: "02",
+      icon: "stream",
+      title: "Stream",
+      description: "See what's happening in real time.",
+      accent: "building",
+    },
+    {
+      num: "03",
+      icon: "deck",
+      title: "Deck",
+      description: "Understand and operate with confidence.",
+      accent: "active",
+    },
+  ],
+  class: className,
+} = Astro.props;
+---
+
+<ol class:list={["locald-story", className]}>
+  {
+    steps.map((step) => (
+      <li class="locald-story__step">
+        <span
+          class:list={["locald-story__ring", `locald-story__ring--${step.accent}`]}
+          aria-hidden="true"
+        >
+          {step.num}
+        </span>
+        <div class="locald-story__body">
+          <PrincipleCard icon={step.icon} title={step.title} layout="stacked">
+            {step.description}
+          </PrincipleCard>
+        </div>
+      </li>
+    ))
+  }
+</ol>
+
+<style>
+  .locald-story {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-space-3);
+  }
+
+  .locald-story__step {
+    display: grid;
+    grid-template-columns: 2.5rem minmax(0, 1fr);
+    gap: var(--locald-space-3);
+    align-items: start;
+    position: relative;
+  }
+
+  /* Dashed connector line between the rings. */
+  .locald-story__step:not(:last-child)::before {
+    content: "";
+    position: absolute;
+    left: 1.25rem;
+    top: 2.5rem;
+    bottom: calc(-1 * var(--locald-space-3));
+    width: 1px;
+    border-left: 1px dashed var(--locald-border-strong);
+  }
+
+  .locald-story__ring {
+    width: 2.5rem;
+    height: 2.5rem;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    border: 1.5px solid var(--locald-border-strong);
+    font-family: var(--locald-font-mono);
+    font-size: 0.8rem;
+    color: var(--locald-text-secondary);
+    background: var(--locald-canvas);
+    position: relative;
+    z-index: 1;
+  }
+
+  .locald-story__ring--running {
+    border-color: var(--locald-status-running);
+    color: var(--locald-status-running);
+  }
+  .locald-story__ring--building {
+    border-color: var(--locald-status-building);
+    color: var(--locald-status-building);
+  }
+  .locald-story__ring--active {
+    border-color: var(--locald-status-active);
+    color: var(--locald-status-active);
+  }
+
+  .locald-story__body {
+    min-width: 0;
+    padding-top: var(--locald-gap-xs);
+  }
+</style>

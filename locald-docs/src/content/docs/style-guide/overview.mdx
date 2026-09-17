@@ -1,0 +1,69 @@
+---
+title: locald
+description: The locald visual style guide overview — brand principle, core vocabulary, and the system topology that ties Rack, Stream, hub, domains, Deck, and System Plane together.
+template: splash
+tableOfContents: false
+---
+
+import StyleGuidePage from "../../../components/styleguide/StyleGuidePage.astro";
+import PrincipleCard from "../../../components/styleguide/PrincipleCard.astro";
+import ServiceTopology from "../../../components/diagrams/ServiceTopology.astro";
+
+<StyleGuidePage
+  title="locald"
+  subtitle="Visual Style Guide"
+  version="v0.1"
+  lede="Run your local app like it's already on a platform."
+  page="01"
+  meta={[
+    { key: "PLATFORM", value: "local" },
+    { key: "SCOPE", value: "development" },
+    { key: "PROTOCOL", value: "https" },
+    { key: "OBSERVABILITY", value: "built-in" },
+    { key: "PHILOSOPHY", value: "local immediacy, platform rigor" },
+  ]}
+  metaCommand="$ locald --version"
+>
+
+<div class="locald-overview">
+
+<div class="locald-principle-band">
+  <div class="locald-principle-band__ring" aria-hidden="true">
+    &gt;_
+  </div>
+  <div class="locald-principle-band__body">
+    <p class="locald-section-label">Brand Principle</p>
+    <p class="locald-principle-band__statement">
+      Local immediacy, platform rigor.
+    </p>
+  </div>
+</div>
+
+<section>
+  <div class="locald-section-head">
+    <p class="locald-section-label">The locald Vocabulary</p>
+    <p class="locald-section-lede">
+      Four core nouns shape how locald works and how we talk about it.
+    </p>
+  </div>
+  <div class="locald-noun-grid">
+    <PrincipleCard icon="rack" title="Rack" layout="stacked">
+      The unit of organization. A project's services running together.
+    </PrincipleCard>
+    <PrincipleCard icon="stream" title="Stream" layout="stacked">
+      Real-time logs, metrics, and events flowing from your services.
+    </PrincipleCard>
+    <PrincipleCard icon="deck" title="Deck" layout="stacked">
+      The dashboard surface for observability and control.
+    </PrincipleCard>
+    <PrincipleCard icon="system-plane" title="System Plane" layout="stacked">
+      The platform services that provide routing, identity, and certificates.
+    </PrincipleCard>
+  </div>
+</section>
+
+<ServiceTopology />
+
+</div>
+
+</StyleGuidePage>

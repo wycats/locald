@@ -1,0 +1,152 @@
+---
+/*
+ * DeckCard — one focused monitor card in the Deck (Product Surface Grammar
+ * poster, page 03, top band, third column). A header with a lock + domain +
+ * status dot, then a metric row: a primary metric (p95 / jobs) with value, a
+ * sparkline, and a trailing throughput metric (RPS / QPS / ok%).
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-3-grammar.png. Domains use
+ * *.localhost (written-guide rule), not the poster's .test.
+ */
+
+type Tone = "running" | "building" | "active" | "network";
+
+interface Props {
+  domain: string;
+  /** Status dot color. */
+  status?: "running" | "building" | "failed" | "active" | "network";
+  /** Primary metric label, e.g. "p95" / "jobs". */
+  metricLabel: string;
+  metricValue: string;
+  /** Trailing throughput, e.g. "RPS 128" / "ok 98%". */
+  throughput: string;
+  /** Sparkline color tone. */
+  tone?: Tone;
+  class?: string;
+}
+
+const {
+  domain,
+  status = "running",
+  metricLabel,
+  metricValue,
+  throughput,
+  tone = "active",
+  class: className,
+} = Astro.props;
+
+const sparkColor: Record<Tone, string> = {
+  running: "var(--locald-status-running)",
+  building: "var(--locald-status-building)",
+  active: "var(--locald-status-active)",
+  network: "var(--locald-status-network)",
+};
+---
+
+<article class:list={["locald-deckcard", className]}>
+  <header class="locald-deckcard__head">
+    <span class="locald-deckcard__lock" aria-hidden="true">
+      <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
+        <rect x="2" y="5" width="7" height="5" rx="1" stroke="currentColor" stroke-width="1"></rect>
+        <path d="M3.5 5V3.5a2 2 0 0 1 4 0V5" stroke="currentColor" stroke-width="1"></path>
+      </svg>
+    </span>
+    <span class="locald-deckcard__domain">{domain}</span>
+    <span class={`locald-deckcard__dot locald-status--${status}`} aria-hidden="true"></span>
+  </header>
+
+  <div class="locald-deckcard__body">
+    <span class="locald-deckcard__metric">
+      <span class="locald-deckcard__metric-label">{metricLabel}</span>
+      <span class="locald-deckcard__metric-value">{metricValue}</span>
+    </span>
+
+    <svg class="locald-deckcard__spark" width="92" height="22" viewBox="0 0 92 22" fill="none" aria-hidden="true">
+      <path
+        d="M1 16 L13 10 L25 14 L37 5 L49 12 L61 7 L73 13 L91 6"
+        stroke={sparkColor[tone]}
+        stroke-width="1.25"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      ></path>
+    </svg>
+
+    <span class="locald-deckcard__throughput">{throughput}</span>
+  </div>
+</article>
+
+<style>
+  .locald-deckcard {
+    border: 1px solid var(--locald-border-strong);
+    border-radius: var(--locald-radius-md);
+    background: var(--locald-surface-2);
+    padding: var(--locald-gap-md) var(--locald-space-2);
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-md);
+  }
+
+  .locald-deckcard__head {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+  }
+
+  .locald-deckcard__lock {
+    color: var(--locald-text-muted);
+    display: inline-flex;
+  }
+
+  .locald-deckcard__domain {
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-deckcard__dot {
+    margin-left: auto;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    flex: none;
+  }
+
+  .locald-deckcard__body {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-space-2);
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+  }
+
+  .locald-deckcard__metric {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.4em;
+  }
+
+  .locald-deckcard__metric-label {
+    color: var(--locald-text-muted);
+  }
+
+  .locald-deckcard__metric-value {
+    color: var(--locald-text-primary);
+  }
+
+  .locald-deckcard__spark {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .locald-deckcard__throughput {
+    color: var(--locald-text-muted);
+    white-space: nowrap;
+  }
+
+  /* Status dot colors */
+  .locald-status--running { background: var(--locald-status-running); }
+  .locald-status--building { background: var(--locald-status-building); }
+  .locald-status--failed { background: var(--locald-status-failed); }
+  .locald-status--active { background: var(--locald-status-active); }
+  .locald-status--network { background: var(--locald-status-network); }
+</style>

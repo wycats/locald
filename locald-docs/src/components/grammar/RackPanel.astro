@@ -1,0 +1,174 @@
+---
+/*
+ * RackPanel — the Rack mockup from the Product Surface Grammar poster (page 03,
+ * top band, left). A titled panel ("RACK (your project)") listing service rows:
+ * a cube icon, the service name, and a status dot + status label. The final row
+ * is the System Plane, marked distinct by a dashed amber border and a VIRTUAL
+ * tag.
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-3-grammar.png. Domains use
+ * *.localhost (written-guide rule); this panel shows names only, no domains.
+ */
+
+type Status = "running" | "virtual";
+
+interface ServiceItem {
+  name: string;
+  status: Status;
+}
+
+interface Props {
+  title?: string;
+  services?: ServiceItem[];
+  class?: string;
+}
+
+const {
+  title = "RACK (your project)",
+  services = [
+    { name: "web", status: "running" },
+    { name: "api", status: "running" },
+    { name: "worker", status: "running" },
+    { name: "db", status: "running" },
+    { name: "System Plane", status: "virtual" },
+  ],
+  class: className,
+} = Astro.props;
+---
+
+<section class:list={["locald-rackpanel", className]} aria-label={title}>
+  <p class="locald-rackpanel__title">{title}</p>
+  <ul class="locald-rackpanel__list">
+    {
+      services.map((s) => (
+        <li
+          class:list={[
+            "locald-rackpanel__row",
+            s.status === "virtual" && "locald-rackpanel__row--virtual",
+          ]}
+        >
+          <span class="locald-rackpanel__icon" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+              <path
+                d="M10 2.5 16.5 6v8L10 17.5 3.5 14V6z"
+                stroke="currentColor"
+                stroke-width="1.25"
+                stroke-linejoin="round"
+              />
+              <path
+                d="M10 2.5 16.5 6 10 9.5 3.5 6zM10 9.5v8"
+                stroke="currentColor"
+                stroke-width="1.25"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </span>
+          <span class="locald-rackpanel__name">{s.name}</span>
+          <span class="locald-rackpanel__status">
+            <span
+              class:list={[
+                "locald-rackpanel__dot",
+                `locald-rackpanel__dot--${s.status}`,
+              ]}
+              aria-hidden="true"
+            />
+            <span class="locald-rackpanel__state">
+              {s.status === "virtual" ? "VIRTUAL" : "RUNNING"}
+            </span>
+          </span>
+        </li>
+      ))
+    }
+  </ul>
+</section>
+
+<style>
+  .locald-rackpanel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-md);
+  }
+
+  .locald-rackpanel__title {
+    margin: 0;
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-muted);
+  }
+
+  .locald-rackpanel__list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-sm);
+  }
+
+  .locald-rackpanel__row {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    padding: var(--locald-gap-sm) var(--locald-gap-md);
+    border: 1px solid var(--locald-border-subtle);
+    border-radius: var(--locald-radius-sm);
+    background: var(--locald-surface-2);
+  }
+
+  .locald-rackpanel__row--virtual {
+    border-style: dashed;
+    border-color: var(--locald-status-network);
+    background: transparent;
+  }
+
+  .locald-rackpanel__icon {
+    color: var(--locald-text-secondary);
+    display: inline-flex;
+  }
+
+  .locald-rackpanel__row--virtual .locald-rackpanel__icon {
+    color: var(--locald-status-network);
+  }
+
+  .locald-rackpanel__name {
+    font-family: var(--locald-font-mono);
+    font-size: 0.8rem;
+    color: var(--locald-text-primary);
+    white-space: nowrap;
+    min-width: 0;
+  }
+
+  .locald-rackpanel__status {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    flex: none;
+  }
+
+  .locald-rackpanel__dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    flex: none;
+  }
+
+  .locald-rackpanel__dot--running {
+    background: var(--locald-status-running);
+  }
+
+  .locald-rackpanel__dot--virtual {
+    background: var(--locald-status-network);
+  }
+
+  .locald-rackpanel__state {
+    font-family: var(--locald-font-mono);
+    font-size: 0.65rem;
+    letter-spacing: 0.08em;
+    color: var(--locald-text-muted);
+  }
+
+  .locald-rackpanel__row--virtual .locald-rackpanel__state {
+    color: var(--locald-status-network);
+  }
+</style>

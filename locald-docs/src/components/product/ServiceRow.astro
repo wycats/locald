@@ -1,0 +1,163 @@
+---
+/*
+ * ServiceRow — the basic unit of the Rack.
+ *
+ * Anatomy (patterns poster panel 01), answering in order:
+ *   1. What service is this?   -> kind icon + name
+ *   2. What state is it in?    -> StatusChip
+ *   3. What type of thing?     -> type hint (WEB, HTTP API, PG, ...)
+ *   4. Where can I open it?    -> UrlPill (when running + addressable)
+ *   5. What can I do to it?    -> trailing action glyphs
+ *
+ * Composes StatusChip + UrlPill so the Rack and the chips stay one system.
+ */
+import StatusChip from "./StatusChip.astro";
+import UrlPill from "./UrlPill.astro";
+
+type Status = "running" | "building" | "failed" | "active" | "idle" | "warning";
+type Kind = "web" | "api" | "worker" | "db" | "docs" | "system";
+
+interface Props {
+  name: string;
+  kind?: Kind;
+  /** Human type hint shown next to the name, e.g. "HTTP API". Defaults from kind. */
+  typeHint?: string;
+  status?: Status;
+  /** Domain for the URL pill, e.g. "api.localhost". Omit when not addressable. */
+  url?: string;
+  class?: string;
+}
+
+const KIND_HINT: Record<Kind, string> = {
+  web: "Web",
+  api: "HTTP API",
+  worker: "Worker",
+  db: "Database",
+  docs: "Docs",
+  system: "System",
+};
+
+const {
+  name,
+  kind = "web",
+  typeHint,
+  status = "running",
+  url,
+  class: className,
+} = Astro.props;
+
+const hint = typeHint ?? KIND_HINT[kind];
+---
+
+<div class:list={["locald-service-row", className]} data-kind={kind}>
+  <span class="locald-service-row__icon" aria-hidden="true">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+      <rect
+        x="2.5"
+        y="2.5"
+        width="11"
+        height="11"
+        rx="2"
+        stroke="currentColor"
+        stroke-width="1.25"></rect>
+      <path d="M2.5 6.5h11M6 6.5v7" stroke="currentColor" stroke-width="1.25"
+      ></path>
+    </svg>
+  </span>
+
+  <span class="locald-service-row__name">{name}</span>
+  <span class="locald-service-row__hint">{hint}</span>
+
+  <span class="locald-service-row__status">
+    <StatusChip status={status} />
+  </span>
+
+  {
+    url && (
+      <span class="locald-service-row__url">
+        <UrlPill href={url} status={status} static />
+      </span>
+    )
+  }
+
+  <span class="locald-service-row__actions" aria-hidden="true">
+    <span class="locald-service-row__action" title="Activity">
+      <svg width="16" height="12" viewBox="0 0 16 12" fill="none">
+        <path
+          d="M1 8l3-5 3 7 3-9 2 6h3"
+          stroke="currentColor"
+          stroke-width="1.25"
+          stroke-linecap="round"
+          stroke-linejoin="round"></path>
+      </svg>
+    </span>
+    <span class="locald-service-row__action" title="Open shell">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+        <path
+          d="M3 4l3 3-3 3M7.5 10H11"
+          stroke="currentColor"
+          stroke-width="1.25"
+          stroke-linecap="round"
+          stroke-linejoin="round"></path>
+      </svg>
+    </span>
+    <span class="locald-service-row__action" title="More">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+        <circle cx="7" cy="3" r="1" fill="currentColor"></circle>
+        <circle cx="7" cy="7" r="1" fill="currentColor"></circle>
+        <circle cx="7" cy="11" r="1" fill="currentColor"></circle>
+      </svg>
+    </span>
+  </span>
+</div>
+
+<style>
+  .locald-service-row {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-md);
+    padding: var(--locald-gap-md) var(--locald-gap-lg);
+    border: 1px solid var(--locald-border-subtle);
+    border-radius: var(--locald-radius-md);
+    background: var(--locald-surface-1);
+    font-family: var(--locald-font-sans);
+  }
+
+  .locald-service-row__icon {
+    color: var(--locald-text-muted);
+    display: inline-flex;
+    flex: none;
+  }
+
+  .locald-service-row__name {
+    font-weight: 600;
+    color: var(--locald-text-primary);
+  }
+
+  .locald-service-row__hint {
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-muted);
+  }
+
+  /* Push status + url + actions to the right, status first. */
+  .locald-service-row__status {
+    margin-left: auto;
+  }
+
+  .locald-service-row__url {
+    display: inline-flex;
+  }
+
+  .locald-service-row__actions {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    color: var(--locald-text-muted);
+  }
+
+  .locald-service-row__action {
+    display: inline-flex;
+    padding: 0.125rem;
+    border-radius: var(--locald-radius-sm);
+  }
+</style>
